@@ -1,3 +1,6 @@
+discord.py
+tzdata
+
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║                    SANCTION — Bot de modération                          ║
@@ -2041,9 +2044,6 @@ async def _resetcasier(ctx, *, user_input: str = None):
 
 
 # ========================= LOOP D'EXPIRATION (vraie logique) =========================
-
-# On enlève le placeholder de la partie 1 en redéfinissant
-expire_sanctions_loop.cancel()
 
 
 @tasks.loop(seconds=30)
