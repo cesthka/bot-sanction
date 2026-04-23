@@ -30,23 +30,63 @@ DEFAULT_BUYER_IDS = [1312375517927706630, 1312375955737542676]
 DEFAULT_PREFIX = "-"
 DB_PATH = "sanction.db"
 
-# Limites par rang (mute max en secondes selon rang de l'auteur)
-MUTE_LIMITS = {
-    1: 60 * 60,            # Helper : max 1h
-    2: 60 * 60 * 24,       # Modo : max 24h
-    3: 60 * 60 * 24 * 28,  # Sys : max 28 jours (limite Discord)
-    4: 60 * 60 * 24 * 28,  # Buyer : idem
+# ==== SYSTÈME DE PERMS PAR NIVEAUX (1-9) ====
+# Les rangs DB restent 0-4 mais seuls 3 (Sys) et 4 (Buyer) sont utilisés pour le bypass
+# Tout le reste passe par les rôles Discord assignés à un niveau de perm
+
+MAX_PERM_LEVEL = 9
+
+# Perm par défaut de chaque commande de modération au premier lancement
+# (Tu modifies après via `-setcmdperm <cmd> <niveau>`)
+DEFAULT_CMD_PERMS = {
+    # Niveau 1 — accès léger
+    "warn":        1,
+    "casier":      1,
+    "sanction":    1,
+    "notes":       1,
+    "mylimits":    1,  # accessible à tout staff avec perm ≥ 1
+    "modstats":    1,
+    # Niveau 2
+    "mute":        2,
+    "vmute":       2,
+    "unmute":      2,
+    "unvmute":     2,
+    "slowmode":    2,
+    "clear":       2,  # ex-purge
+    # Niveau 3
+    "kick":        3,
+    "lock":        3,
+    "unlock":      3,
+    "note":        3,
+    "delnote":     3,
+    "unwarn":      3,
+    "traiter":     3,
+    "appels":      3,
+    # Niveau 4
+    "ban":         4,
+    "unban":       4,
+    "unsanction":  4,
+    # Niveau 5
+    "clearwarns":  5,
+    "resetcasier": 5,
 }
 
-PURGE_LIMITS = {
-    1: 20,   # Helper : max 20 messages
-    2: 100,  # Modo : max 100
-    3: 500,  # Sys : max 500
-    4: 500,
+# Limites par défaut : (max_actions, window_minutes) par niveau qui a accès
+# Pour chaque commande, on définit le niveau minimum requis et combien d'actions max par fenêtre
+# Format : {commande: {niveau: (max, fenêtre_minutes)}}
+# Si une commande n'a pas d'entrée pour un niveau donné, c'est illimité à ce niveau (pas le cas par défaut)
+DEFAULT_LIMITS = {
+    # Ces valeurs sont des defaults raisonnables pour éviter les abus
+    # Le modérateur avec ce niveau est limité ; Sys+ bypass toujours
+    "warn":   {1: (10, 30), 2: (20, 30), 3: (50, 30), 4: (50, 30), 5: (100, 30)},
+    "mute":   {2: (5, 30),  3: (10, 30), 4: (20, 30), 5: (50, 30)},
+    "vmute":  {2: (5, 30),  3: (10, 30), 4: (20, 30), 5: (50, 30)},
+    "kick":   {3: (3, 30),  4: (10, 30), 5: (20, 30)},
+    "ban":    {4: (3, 30),  5: (10, 30)},
+    "clear":  {2: (10, 10), 3: (30, 10), 4: (50, 10), 5: (100, 10)},
 }
 
 # Auto-escalation par défaut (seuil_warns → action, durée_secondes)
-# Action : "mute", "kick", "ban"
 DEFAULT_ESCALATION = [
     {"warns": 3,  "action": "mute", "duration": 3600,      "reason": "Escalation auto (3 warns)"},
     {"warns": 5,  "action": "mute", "duration": 21600,     "reason": "Escalation auto (5 warns)"},
@@ -58,10 +98,10 @@ DEFAULT_ESCALATION = [
 # Anti-raid par défaut
 DEFAULT_ANTIRAID = {
     "enabled": False,
-    "joins_threshold": 5,      # X comptes
-    "window_seconds": 10,      # en Y secondes
-    "action": "timeout",       # "timeout" ou "kick"
-    "timeout_duration": 3600,  # 1h par défaut
+    "joins_threshold": 5,
+    "window_seconds": 10,
+    "action": "timeout",
+    "timeout_duration": 3600,
 }
 
 RAISON_MIN_LENGTH = 5
@@ -181,6 +221,43 @@ def init_db():
         reason TEXT
     )""")
 
+    # ===== NOUVEAU SYSTÈME DE PERMS (rôles → niveau 1-9) =====
+
+    # Rôles Discord attribués à un niveau de perm
+    c.execute("""CREATE TABLE IF NOT EXISTS role_perms (
+        guild_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        perm_level INTEGER NOT NULL CHECK (perm_level BETWEEN 1 AND 9),
+        set_by TEXT,
+        set_at TEXT,
+        PRIMARY KEY (guild_id, role_id)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_role_perms_guild ON role_perms(guild_id)")
+
+    # Historique des actions pour fenêtre glissante des limites
+    c.execute("""CREATE TABLE IF NOT EXISTS action_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        command TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_action_hist ON action_history(user_id, command, created_at)")
+
+    # Historique des deranks automatiques
+    c.execute("""CREATE TABLE IF NOT EXISTS derank_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        removed_at TEXT NOT NULL,
+        reason TEXT,
+        reranked_at TEXT,
+        reranked_by TEXT,
+        rerank_reason TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_derank_user ON derank_history(user_id, guild_id)")
+
     # Default config
     c.execute("INSERT OR IGNORE INTO config VALUES ('prefix', ?)", (DEFAULT_PREFIX,))
     c.execute("INSERT OR IGNORE INTO config VALUES ('buyer_ids', ?)",
@@ -189,6 +266,12 @@ def init_db():
               (json.dumps(DEFAULT_ESCALATION),))
     c.execute("INSERT OR IGNORE INTO config VALUES ('antiraid', ?)",
               (json.dumps(DEFAULT_ANTIRAID),))
+    # Perms des commandes (modifiables via -setcmdperm)
+    c.execute("INSERT OR IGNORE INTO config VALUES ('cmd_perms', ?)",
+              (json.dumps(DEFAULT_CMD_PERMS),))
+    # Limites des commandes (modifiables via -setlimit)
+    c.execute("INSERT OR IGNORE INTO config VALUES ('limits', ?)",
+              (json.dumps(DEFAULT_LIMITS),))
 
     conn.commit()
     conn.close()
@@ -246,6 +329,244 @@ def set_antiraid(cfg):
     set_config("antiraid", json.dumps(cfg))
 
 
+# ---- Système de perms (rôles → niveau 1-9) ----
+
+def get_cmd_perms():
+    """Retourne le mapping {commande: niveau_perm}."""
+    raw = get_config("cmd_perms")
+    if not raw:
+        return dict(DEFAULT_CMD_PERMS)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return dict(DEFAULT_CMD_PERMS)
+
+
+def set_cmd_perm(command, level):
+    cp = get_cmd_perms()
+    cp[command] = int(level)
+    set_config("cmd_perms", json.dumps(cp))
+
+
+def get_cmd_perm(command):
+    """Retourne le niveau de perm requis pour une commande (ou None si pas géré)."""
+    cp = get_cmd_perms()
+    return cp.get(command)
+
+
+def role_perm_add(guild_id, role_id, level, set_by):
+    conn = get_db()
+    now = datetime.now(PARIS_TZ).isoformat()
+    conn.execute("""INSERT OR REPLACE INTO role_perms
+        (guild_id, role_id, perm_level, set_by, set_at) VALUES (?, ?, ?, ?, ?)""",
+        (str(guild_id), str(role_id), int(level), str(set_by), now))
+    conn.commit()
+    conn.close()
+
+
+def role_perm_remove(guild_id, role_id):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM role_perms WHERE guild_id = ? AND role_id = ?",
+                       (str(guild_id), str(role_id)))
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+
+def role_perm_list(guild_id):
+    """Liste tous les rôles configurés dans cette guild."""
+    conn = get_db()
+    rows = conn.execute("""SELECT role_id, perm_level FROM role_perms
+        WHERE guild_id = ? ORDER BY perm_level DESC""",
+        (str(guild_id),)).fetchall()
+    conn.close()
+    return [(r["role_id"], r["perm_level"]) for r in rows]
+
+
+def role_perm_get_level(guild_id, role_id):
+    conn = get_db()
+    row = conn.execute("""SELECT perm_level FROM role_perms
+        WHERE guild_id = ? AND role_id = ?""",
+        (str(guild_id), str(role_id))).fetchone()
+    conn.close()
+    return int(row["perm_level"]) if row else None
+
+
+def get_member_perm_level(member):
+    """
+    Retourne le niveau de perm max d'un membre selon ses rôles.
+    0 = aucune perm (simple membre).
+    Sys/Buyer sont traités à part (bypass complet dans le check, pas ici).
+    """
+    if not member or not hasattr(member, "roles"):
+        return 0
+    conn = get_db()
+    guild_id = str(member.guild.id)
+    # Récupère tous les rôles-perms de la guild
+    rows = conn.execute("""SELECT role_id, perm_level FROM role_perms
+        WHERE guild_id = ?""", (guild_id,)).fetchall()
+    conn.close()
+    if not rows:
+        return 0
+    configured = {str(r["role_id"]): int(r["perm_level"]) for r in rows}
+    member_role_ids = {str(r.id) for r in member.roles}
+    max_level = 0
+    for rid, lvl in configured.items():
+        if rid in member_role_ids and lvl > max_level:
+            max_level = lvl
+    return max_level
+
+
+def get_member_perm_role_id(member, target_level):
+    """
+    Retourne l'ID du rôle du membre qui lui donne ce niveau exact de perm,
+    ou None s'il n'en a pas.
+    Utilisé pour le derank auto (on retire que le rôle de ce niveau).
+    """
+    if not member or not hasattr(member, "roles"):
+        return None
+    conn = get_db()
+    rows = conn.execute("""SELECT role_id, perm_level FROM role_perms
+        WHERE guild_id = ?""", (str(member.guild.id),)).fetchall()
+    conn.close()
+    configured = {str(r["role_id"]): int(r["perm_level"]) for r in rows}
+    member_role_ids = {str(r.id) for r in member.roles}
+    for rid in member_role_ids:
+        if rid in configured and configured[rid] == target_level:
+            return int(rid)
+    return None
+
+
+# ---- Limites par commande (fenêtre glissante) ----
+
+def get_limits():
+    """Retourne le dict {commande: {niveau: [max, fenêtre_min]}}."""
+    raw = get_config("limits")
+    if not raw:
+        return dict(DEFAULT_LIMITS)
+    try:
+        parsed = json.loads(raw)
+        # Les clés niveau sont stockées en string après sérialisation JSON, on reconvertit
+        result = {}
+        for cmd, levels in parsed.items():
+            result[cmd] = {int(k): tuple(v) for k, v in levels.items()}
+        return result
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return dict(DEFAULT_LIMITS)
+
+
+def set_limit(command, level, max_actions, window_minutes):
+    limits = get_limits()
+    if command not in limits:
+        limits[command] = {}
+    limits[command][int(level)] = (int(max_actions), int(window_minutes))
+    # On stocke avec les tuples en listes (JSON ne supporte pas les tuples)
+    serializable = {cmd: {str(k): list(v) for k, v in lvls.items()}
+                    for cmd, lvls in limits.items()}
+    set_config("limits", json.dumps(serializable))
+
+
+def remove_limit(command, level):
+    limits = get_limits()
+    if command in limits and int(level) in limits[command]:
+        del limits[command][int(level)]
+        if not limits[command]:
+            del limits[command]
+        serializable = {cmd: {str(k): list(v) for k, v in lvls.items()}
+                        for cmd, lvls in limits.items()}
+        set_config("limits", json.dumps(serializable))
+        return True
+    return False
+
+
+def get_limit_for(command, level):
+    """Retourne (max_actions, window_minutes) pour cette commande à ce niveau, ou None si illimité."""
+    limits = get_limits()
+    cmd_limits = limits.get(command, {})
+    # On cherche le niveau le plus proche en-dessous ou égal
+    applicable = None
+    for lvl, val in cmd_limits.items():
+        if int(lvl) == int(level):
+            applicable = val
+            break
+    # Si pas trouvé exact, on prend la limite du niveau le plus proche en dessous
+    if applicable is None:
+        candidates = [int(k) for k in cmd_limits.keys() if int(k) <= int(level)]
+        if candidates:
+            applicable = cmd_limits[max(candidates)]
+    return applicable
+
+
+def record_action(user_id, guild_id, command):
+    """Enregistre une action pour le suivi des limites."""
+    conn = get_db()
+    now = datetime.now(PARIS_TZ).isoformat()
+    conn.execute("""INSERT INTO action_history (user_id, guild_id, command, created_at)
+        VALUES (?, ?, ?, ?)""",
+        (str(user_id), str(guild_id), command, now))
+    conn.commit()
+    conn.close()
+
+
+def count_recent_actions(user_id, guild_id, command, window_minutes):
+    """Compte les actions dans la fenêtre glissante."""
+    conn = get_db()
+    cutoff = (datetime.now(PARIS_TZ) - timedelta(minutes=window_minutes)).isoformat()
+    row = conn.execute("""SELECT COUNT(*) as c FROM action_history
+        WHERE user_id = ? AND guild_id = ? AND command = ? AND created_at >= ?""",
+        (str(user_id), str(guild_id), command, cutoff)).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def cleanup_old_actions(days=7):
+    """Nettoie les actions de plus de X jours (pour éviter que la table grossisse)."""
+    conn = get_db()
+    cutoff = (datetime.now(PARIS_TZ) - timedelta(days=days)).isoformat()
+    conn.execute("DELETE FROM action_history WHERE created_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+# ---- Derank auto ----
+
+def record_derank(user_id, guild_id, role_id, reason):
+    conn = get_db()
+    now = datetime.now(PARIS_TZ).isoformat()
+    cur = conn.execute("""INSERT INTO derank_history
+        (user_id, guild_id, role_id, removed_at, reason) VALUES (?, ?, ?, ?, ?)""",
+        (str(user_id), str(guild_id), str(role_id), now, reason))
+    derank_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return derank_id
+
+
+def record_rerank(derank_id, rerank_by, rerank_reason):
+    conn = get_db()
+    now = datetime.now(PARIS_TZ).isoformat()
+    cur = conn.execute("""UPDATE derank_history
+        SET reranked_at = ?, reranked_by = ?, rerank_reason = ?
+        WHERE id = ? AND reranked_at IS NULL""",
+        (now, str(rerank_by), rerank_reason, derank_id))
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+
+def get_last_derank(user_id, guild_id):
+    """Retourne le dernier derank non encore rerank pour ce user."""
+    conn = get_db()
+    row = conn.execute("""SELECT * FROM derank_history
+        WHERE user_id = ? AND guild_id = ? AND reranked_at IS NULL
+        ORDER BY removed_at DESC LIMIT 1""",
+        (str(user_id), str(guild_id))).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 # ---- Rangs ----
 
 def get_rank_db(user_id):
@@ -282,7 +603,7 @@ def has_min_rank(user_id, minimum):
 
 
 def rank_name(level):
-    return {4: "Buyer", 3: "Sys", 2: "Modérateur", 1: "Helper", 0: "Aucun"}[level]
+    return {4: "Buyer", 3: "Sys", 0: "Aucun"}.get(level, "Aucun")
 
 
 # ---- Bot ban ----
@@ -773,23 +1094,178 @@ def format_user_display(display_obj, user_id):
 
 # ========================= CHECKS HIÉRARCHIQUES =========================
 
-def can_sanction_target(author_id, target_id):
+def is_sys_or_buyer(user_id):
+    return get_rank_db(user_id) >= 3
+
+
+def can_sanction_target(author_member, target_member_or_id):
     """
-    Un rang ne peut jamais sanctionner un rang égal ou supérieur.
+    Règles :
+    - Sys/Buyer peuvent tout sanctionner (sauf autre Buyer pas protégé).
+    - Un membre staff (avec perm) ne peut pas sanctionner quelqu'un de perm égale ou supérieure.
+    - Un membre staff ne peut pas sanctionner un Sys/Buyer.
     Retourne (True, None) si OK, (False, error_msg) sinon.
     """
-    author_rank = get_rank_db(author_id)
-    target_rank = get_rank_db(target_id)
-    if target_rank >= author_rank and author_rank < 4:
-        return False, (
-            f"Tu ne peux pas sanctionner quelqu'un de rang **{rank_name(target_rank)}** "
-            f"(ton rang : **{rank_name(author_rank)}**)."
-        )
-    # Buyer peut tout sauf les autres Buyers
-    if author_rank == 4 and target_rank == 4 and str(author_id) != str(target_id):
-        # On autorise quand même un buyer à agir sur un autre, c'est exceptionnel
+    if hasattr(author_member, "id"):
+        author_id = author_member.id
+    else:
+        author_id = author_member
+
+    # Sys+ bypass complet
+    if is_sys_or_buyer(author_id):
         return True, None
+
+    # Target = Sys/Buyer ? Refus.
+    target_id = target_member_or_id.id if hasattr(target_member_or_id, "id") else target_member_or_id
+    if is_sys_or_buyer(target_id):
+        return False, "Tu ne peux pas sanctionner un **Sys** ou **Buyer**."
+
+    # Compare les niveaux de perm si les deux sont des Member
+    if hasattr(author_member, "roles") and hasattr(target_member_or_id, "roles"):
+        author_perm = get_member_perm_level(author_member)
+        target_perm = get_member_perm_level(target_member_or_id)
+        if target_perm >= author_perm:
+            return False, (
+                f"Tu ne peux pas sanctionner quelqu'un de perm **{target_perm}** "
+                f"(ton niveau : **{author_perm}**)."
+            )
     return True, None
+
+
+async def check_command_perm(ctx, command):
+    """
+    Vérifie qu'un user peut utiliser une commande de modération.
+    Sys+ bypass. Sinon, il faut avoir un rôle dont le niveau ≥ niveau requis par la commande.
+    Retourne (True, None) si OK, (False, error_msg) sinon.
+    Les refus sont SILENCIEUX pour les membres lambda (pas de rôle) — bot staff-only.
+    """
+    # Sys+ bypass
+    if is_sys_or_buyer(ctx.author.id):
+        return True, None
+
+    required_level = get_cmd_perm(command)
+    if required_level is None:
+        # Commande inconnue du système, on refuse par sécurité
+        return False, "Commande non configurée dans le système de perms."
+
+    member_level = get_member_perm_level(ctx.author)
+
+    # Membre lambda (aucun rôle configuré) : refus silencieux total
+    if member_level == 0:
+        return False, "__SILENT__"
+
+    if member_level < required_level:
+        return False, (
+            f"Tu dois avoir **perm {required_level}+** pour utiliser cette commande.\n"
+            f"Ton niveau actuel : **perm {member_level}**."
+        )
+    return True, None
+
+
+async def check_limit_or_derank(ctx, command):
+    """
+    Vérifie si l'utilisateur dépasse la limite pour cette commande.
+    Si oui : retire le rôle qui lui a donné le niveau + notifie + return False.
+    Sys+ bypass complet (pas de limite).
+    Retourne True si OK pour procéder, False si bloqué (déjà renvoyé message à l'auteur).
+    """
+    if is_sys_or_buyer(ctx.author.id):
+        return True
+
+    member_level = get_member_perm_level(ctx.author)
+    if member_level == 0:
+        return False  # ne devrait jamais arriver (check_command_perm bloque avant)
+
+    limit_info = get_limit_for(command, member_level)
+    if not limit_info:
+        # Pas de limite configurée pour ce niveau → on passe, mais on record quand même
+        record_action(ctx.author.id, ctx.guild.id, command)
+        return True
+
+    max_actions, window_minutes = limit_info
+    recent_count = count_recent_actions(ctx.author.id, ctx.guild.id, command, window_minutes)
+
+    # Si on est à la limite (ou au-dessus), on declenche le derank
+    if recent_count >= max_actions:
+        await trigger_auto_derank(ctx, command, member_level, max_actions, window_minutes, recent_count)
+        return False
+
+    # Record + on continue
+    record_action(ctx.author.id, ctx.guild.id, command)
+    return True
+
+
+async def trigger_auto_derank(ctx, command, member_level, max_actions, window_minutes, attempted_count):
+    """
+    Applique le derank : retire le rôle correspondant au niveau de perm atteint.
+    Notifie le staff via DM + log.
+    """
+    # Trouve le rôle exact au niveau où il a dépassé
+    role_id = get_member_perm_role_id(ctx.author, member_level)
+    role = ctx.guild.get_role(role_id) if role_id else None
+
+    reason_text = (
+        f"Dépassement de limite sur `{command}` "
+        f"({attempted_count + 1}e tentative, max autorisé : {max_actions} en {window_minutes}min)"
+    )
+
+    removed = False
+    if role and role in ctx.author.roles:
+        try:
+            await ctx.author.remove_roles(role, reason=f"Derank auto : {reason_text}")
+            removed = True
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"Derank auto: retrait rôle {role.id} échoué : {e}")
+
+    # Enregistrer en DB
+    if role_id:
+        derank_id = record_derank(ctx.author.id, ctx.guild.id, role_id, reason_text)
+    else:
+        derank_id = None
+
+    # Message dans le salon
+    em = error_embed(
+        "⛔ Derank automatique",
+        f"{ctx.author.mention} a dépassé la limite autorisée pour **`{command}`**.\n"
+        f"**Limite :** {max_actions} en {window_minutes}min\n"
+        f"**Tentatives dans la fenêtre :** {attempted_count + 1}\n\n"
+        + (f"➡️ Le rôle {role.mention} lui a été retiré.\n" if removed and role else
+           (f"➡️ Rôle à retirer manuellement.\n" if not removed else ""))
+        + f"Un Sys+ peut le rerank via `{get_prefix_cached()}rerank @user <motif>`."
+    )
+    try:
+        await ctx.send(embed=em)
+    except discord.HTTPException:
+        pass
+
+    # DM au staff derank
+    try:
+        dm_em = discord.Embed(
+            title="⛔ Tu as été derank automatiquement",
+            description=(
+                f"Sur le serveur **{ctx.guild.name}**.\n\n"
+                f"**Commande :** `{command}`\n"
+                f"**Limite :** {max_actions} actions en {window_minutes} minutes\n"
+                f"**Motif :** Dépassement de limite\n\n"
+                f"Ton rôle **{role.name if role else 'staff'}** a été retiré."
+                + (f"\n\nDemande à un Sys+ de justifier ton acte pour être rerank."
+                   if role else "")
+            ),
+            color=0xf04747,
+        )
+        dm_em.set_footer(text="Sanction ・ Meira")
+        await ctx.author.send(embed=dm_em)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    # Log
+    await send_log(
+        ctx.guild, "🚨 DERANK AUTO", ctx.author, ctx.author, ctx.author.id,
+        desc=(f"Rôle retiré : {role.mention if role else 'introuvable'}\n"
+              f"ID derank : `#{derank_id}`" if derank_id else ""),
+        reason=reason_text,
+        color=0xf04747,
+    )
 
 
 # ========================= BOT SETUP =========================
@@ -979,78 +1455,338 @@ async def _unsys(ctx, *, user_input: str = None):
     await send_log(ctx.guild, "Sys retiré", ctx.author, display, uid, color=0xfaa61a)
 
 
-@bot.command(name="mod")
-async def _mod(ctx, *, user_input: str = None):
-    if user_input is None:
-        if not has_min_rank(ctx.author.id, 3):
-            return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-        ids = get_ranks_by_level(2)
-        if not ids:
-            return await ctx.send(embed=info_embed("📋 Liste Modérateurs", "Aucun modérateur."))
-        return await ctx.send(embed=info_embed(f"📋 Modérateurs ({len(ids)})", "\n".join([f"<@{uid}>" for uid in ids])))
+# ========================= SYSTÈME DE PERMS (setperm / setcmdperm / setlimit / rerank) =========================
+
+@bot.command(name="setperm")
+async def _setperm(ctx, role: discord.Role = None, level: int = None):
+    """Attribue un niveau de perm (1-9) à un rôle Discord."""
     if not has_min_rank(ctx.author.id, 3):
         return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-    display, uid = await resolve_user_or_id(ctx, user_input)
-    if uid is None:
-        return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
-    if get_rank_db(uid) >= 3:
-        return await ctx.send(embed=error_embed("❌ Erreur", f"{format_user_display(display, uid)} a un rang supérieur."))
-    set_rank_db(uid, 2)
-    await ctx.send(embed=success_embed("✅ Modérateur ajouté", f"{format_user_display(display, uid)} est maintenant **modérateur**."))
-    await send_log(ctx.guild, "Modo ajouté", ctx.author, display, uid, color=0x43b581)
+    if role is None or level is None:
+        return await ctx.send(embed=error_embed(
+            "Usage",
+            f"`{get_prefix_cached()}setperm <@role> <1-{MAX_PERM_LEVEL}>`\n"
+            f"Ex : `{get_prefix_cached()}setperm @Staff 3`"
+        ))
+    if level < 1 or level > MAX_PERM_LEVEL:
+        return await ctx.send(embed=error_embed(
+            "❌ Niveau invalide",
+            f"Le niveau doit être entre **1** et **{MAX_PERM_LEVEL}**."
+        ))
+    role_perm_add(ctx.guild.id, role.id, level, ctx.author.id)
+    await ctx.send(embed=success_embed(
+        "✅ Perm attribuée",
+        f"{role.mention} → **perm {level}**\n"
+        f"Les membres avec ce rôle peuvent utiliser toutes les commandes de perm ≤ **{level}**."
+    ))
+    await send_log(ctx.guild, "Perm attribuée", ctx.author,
+                   desc=f"{role.mention} → perm {level}", color=0x43b581)
 
 
-@bot.command(name="unmod")
-async def _unmod(ctx, *, user_input: str = None):
+@bot.command(name="unsetperm")
+async def _unsetperm(ctx, role: discord.Role = None):
+    """Retire le niveau de perm d'un rôle."""
     if not has_min_rank(ctx.author.id, 3):
         return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-    if not user_input:
-        return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
-    display, uid = await resolve_user_or_id(ctx, user_input)
-    if uid is None:
-        return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
-    if get_rank_db(uid) != 2:
-        return await ctx.send(embed=error_embed("Pas Modérateur", f"{format_user_display(display, uid)} n'est pas modérateur."))
-    set_rank_db(uid, 0)
-    await ctx.send(embed=success_embed("✅ Modérateur retiré", f"{format_user_display(display, uid)} n'est plus modérateur."))
-    await send_log(ctx.guild, "Modo retiré", ctx.author, display, uid, color=0xfaa61a)
+    if role is None:
+        return await ctx.send(embed=error_embed("Usage", f"`{get_prefix_cached()}unsetperm <@role>`"))
+    if not role_perm_remove(ctx.guild.id, role.id):
+        return await ctx.send(embed=error_embed("Pas de perm", f"{role.mention} n'avait pas de perm."))
+    await ctx.send(embed=success_embed("✅ Perm retirée", f"{role.mention} n'a plus de perm."))
+    await send_log(ctx.guild, "Perm retirée", ctx.author,
+                   desc=role.mention, color=0xfaa61a)
 
 
-@bot.command(name="helper")
-async def _helper(ctx, *, user_input: str = None):
-    if user_input is None:
-        if not has_min_rank(ctx.author.id, 3):
-            return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-        ids = get_ranks_by_level(1)
-        if not ids:
-            return await ctx.send(embed=info_embed("📋 Liste Helpers", "Aucun helper."))
-        return await ctx.send(embed=info_embed(f"📋 Helpers ({len(ids)})", "\n".join([f"<@{uid}>" for uid in ids])))
+@bot.command(name="perms")
+async def _perms(ctx):
+    """Liste tous les rôles configurés avec leurs niveaux."""
+    if not has_min_rank(ctx.author.id, 3) and get_member_perm_level(ctx.author) == 0:
+        return  # refus silencieux
+    rows = role_perm_list(ctx.guild.id)
+    if not rows:
+        return await ctx.send(embed=info_embed(
+            "🎚️ Aucune perm configurée",
+            f"Aucun rôle n'a de niveau de perm.\n"
+            f"Utilise `{get_prefix_cached()}setperm @role <1-9>`."
+        ))
+    by_level = {}
+    for role_id, level in rows:
+        by_level.setdefault(level, []).append(role_id)
+    lines = []
+    for lvl in sorted(by_level.keys(), reverse=True):
+        role_mentions = []
+        for rid in by_level[lvl]:
+            role = ctx.guild.get_role(int(rid))
+            role_mentions.append(role.mention if role else f"*Rôle supprimé* (`{rid}`)")
+        lines.append(f"**Perm {lvl}** : {', '.join(role_mentions)}")
+    em = info_embed(f"🎚️ Rôles configurés ({len(rows)})", "\n".join(lines))
+    em.set_footer(text="Sanction ・ Plus le niveau est élevé, plus de commandes sont accessibles")
+    await ctx.send(embed=em)
+
+
+@bot.command(name="setcmdperm")
+async def _setcmdperm(ctx, command: str = None, level: int = None):
+    """Définit le niveau de perm requis pour une commande."""
     if not has_min_rank(ctx.author.id, 3):
         return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-    display, uid = await resolve_user_or_id(ctx, user_input)
-    if uid is None:
-        return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
-    if get_rank_db(uid) >= 2:
-        return await ctx.send(embed=error_embed("❌ Erreur", f"{format_user_display(display, uid)} a un rang supérieur."))
-    set_rank_db(uid, 1)
-    await ctx.send(embed=success_embed("✅ Helper ajouté", f"{format_user_display(display, uid)} est maintenant **helper**."))
-    await send_log(ctx.guild, "Helper ajouté", ctx.author, display, uid, color=0x43b581)
+    if command is None or level is None:
+        cp = get_cmd_perms()
+        cmd_list = ", ".join(f"`{c}`" for c in sorted(cp.keys()))
+        return await ctx.send(embed=error_embed(
+            "Usage",
+            f"`{get_prefix_cached()}setcmdperm <commande> <1-{MAX_PERM_LEVEL}>`\n"
+            f"Ex : `{get_prefix_cached()}setcmdperm ban 4`\n\n"
+            f"Commandes gérées : {cmd_list}"
+        ))
+    command = command.lower().strip().lstrip("-").lstrip(get_prefix_cached())
+    if command not in get_cmd_perms():
+        return await ctx.send(embed=error_embed(
+            "❌ Commande inconnue",
+            "Cette commande n'est pas gérée par le système de perms.\n"
+            f"Voir `{get_prefix_cached()}cmdperms` pour la liste."
+        ))
+    if level < 1 or level > MAX_PERM_LEVEL:
+        return await ctx.send(embed=error_embed(
+            "❌ Niveau invalide",
+            f"Le niveau doit être entre **1** et **{MAX_PERM_LEVEL}**."
+        ))
+    set_cmd_perm(command, level)
+    await ctx.send(embed=success_embed(
+        "✅ Commande reclassée",
+        f"`{command}` → **perm {level}**"
+    ))
+    await send_log(ctx.guild, "Cmd perm modifiée", ctx.author,
+                   desc=f"`{command}` → perm {level}", color=0x43b581)
 
 
-@bot.command(name="unhelper")
-async def _unhelper(ctx, *, user_input: str = None):
+@bot.command(name="cmdperms")
+async def _cmdperms(ctx):
+    """Liste toutes les commandes avec leur niveau de perm."""
+    if not has_min_rank(ctx.author.id, 3) and get_member_perm_level(ctx.author) == 0:
+        return  # refus silencieux
+    cp = get_cmd_perms()
+    if not cp:
+        return await ctx.send(embed=info_embed("Aucune commande configurée", "Rien à afficher."))
+
+    by_level = {}
+    for cmd, lvl in cp.items():
+        by_level.setdefault(lvl, []).append(cmd)
+
+    lines = []
+    for lvl in sorted(by_level.keys()):
+        cmds_sorted = sorted(by_level[lvl])
+        lines.append(f"**Perm {lvl}** : `" + "` · `".join(cmds_sorted) + "`")
+
+    em = info_embed("🎚️ Commandes par niveau", "\n".join(lines))
+    em.set_footer(text=f"Sanction ・ Modifie via {get_prefix_cached()}setcmdperm <cmd> <niveau>")
+    await ctx.send(embed=em)
+
+
+@bot.command(name="setlimit")
+async def _setlimit(ctx, command: str = None, level: int = None,
+                    max_actions: int = None, window_minutes: int = None):
+    """Définit une limite pour une commande à un niveau de perm."""
     if not has_min_rank(ctx.author.id, 3):
         return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
-    if not user_input:
-        return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
-    display, uid = await resolve_user_or_id(ctx, user_input)
+    if command is None or level is None or max_actions is None or window_minutes is None:
+        return await ctx.send(embed=error_embed(
+            "Usage",
+            f"`{get_prefix_cached()}setlimit <commande> <niveau> <max_actions> <minutes>`\n\n"
+            f"Ex : `{get_prefix_cached()}setlimit ban 4 3 20` → au niveau 4, max 3 bans / 20min"
+        ))
+    command = command.lower().strip().lstrip("-").lstrip(get_prefix_cached())
+    if command not in get_cmd_perms():
+        return await ctx.send(embed=error_embed(
+            "❌ Commande inconnue",
+            f"Voir `{get_prefix_cached()}cmdperms`."
+        ))
+    if level < 1 or level > MAX_PERM_LEVEL:
+        return await ctx.send(embed=error_embed(
+            "❌ Niveau invalide", f"Entre 1 et {MAX_PERM_LEVEL}."))
+    if max_actions < 1 or max_actions > 1000:
+        return await ctx.send(embed=error_embed("❌ Max invalide", "Entre 1 et 1000."))
+    if window_minutes < 1 or window_minutes > 10080:
+        return await ctx.send(embed=error_embed("❌ Fenêtre invalide", "Entre 1 et 10080 min (7j)."))
+
+    set_limit(command, level, max_actions, window_minutes)
+    await ctx.send(embed=success_embed(
+        "✅ Limite configurée",
+        f"`{command}` au niveau **{level}** : max **{max_actions}** actions / **{window_minutes}min**"
+    ))
+    await send_log(ctx.guild, "Limite modifiée", ctx.author,
+                   desc=f"`{command}` lvl {level} → {max_actions}/{window_minutes}min",
+                   color=0x43b581)
+
+
+@bot.command(name="unsetlimit")
+async def _unsetlimit(ctx, command: str = None, level: int = None):
+    """Retire la limite d'une commande à un niveau (illimité)."""
+    if not has_min_rank(ctx.author.id, 3):
+        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+    if command is None or level is None:
+        return await ctx.send(embed=error_embed(
+            "Usage",
+            f"`{get_prefix_cached()}unsetlimit <commande> <niveau>`"
+        ))
+    command = command.lower().strip().lstrip("-").lstrip(get_prefix_cached())
+    if not remove_limit(command, level):
+        return await ctx.send(embed=error_embed("Pas de limite", f"Pas de limite pour `{command}` au niveau {level}."))
+    await ctx.send(embed=success_embed("✅ Limite retirée", f"`{command}` au niveau {level} : illimité."))
+
+
+@bot.command(name="limits")
+async def _limits(ctx):
+    """Affiche toutes les limites configurées."""
+    if not has_min_rank(ctx.author.id, 3) and get_member_perm_level(ctx.author) == 0:
+        return  # silencieux
+    limits = get_limits()
+    if not limits:
+        return await ctx.send(embed=info_embed("Aucune limite", "Aucune limite configurée."))
+
+    lines = []
+    for cmd in sorted(limits.keys()):
+        for lvl in sorted(limits[cmd].keys()):
+            max_a, window = limits[cmd][lvl]
+            lines.append(f"`{cmd}` ・ perm **{lvl}** → **{max_a}** / **{window}min**")
+
+    em = info_embed("⏱️ Limites par commande et niveau", "\n".join(lines))
+    em.set_footer(text=f"Sanction ・ Sys/Buyer bypass toutes les limites")
+    await ctx.send(embed=em)
+
+
+@bot.command(name="mylimits")
+async def _mylimits(ctx):
+    """Affiche les quotas restants du staff pour chaque commande."""
+    # Bypass Sys+
+    if is_sys_or_buyer(ctx.author.id):
+        return await ctx.send(embed=info_embed(
+            "⏱️ Tes limites",
+            "Tu es **Sys** ou **Buyer** : aucune limite ne s'applique à toi."
+        ))
+
+    member_level = get_member_perm_level(ctx.author)
+    if member_level == 0:
+        return  # silencieux (pas staff)
+
+    limits = get_limits()
+    cmd_perms = get_cmd_perms()
+
+    # Pour chaque commande accessible à son niveau, check sa consommation actuelle
+    accessible = [(cmd, lvl) for cmd, lvl in cmd_perms.items() if lvl <= member_level]
+    lines = []
+    for cmd, required_lvl in sorted(accessible):
+        limit_info = get_limit_for(cmd, member_level)
+        if not limit_info:
+            continue  # pas de limite → pas intéressant d'afficher
+        max_a, window = limit_info
+        used = count_recent_actions(ctx.author.id, ctx.guild.id, cmd, window)
+        remaining = max(0, max_a - used)
+        bar = "🟢" if remaining > max_a * 0.5 else ("🟡" if remaining > 0 else "🔴")
+        lines.append(f"{bar} `{cmd}` : **{remaining}/{max_a}** restants (fenêtre {window}min)")
+
+    if not lines:
+        return await ctx.send(embed=info_embed(
+            "⏱️ Tes limites",
+            f"Aucune limite active sur les commandes de ton niveau (**perm {member_level}**)."
+        ))
+
+    em = info_embed(f"⏱️ Tes quotas — perm {member_level}", "\n".join(lines))
+    em.set_footer(text="Sanction ・ Attention : dépasser une limite = derank automatique")
+    await ctx.send(embed=em)
+
+
+@bot.command(name="rerank")
+async def _rerank(ctx, *, args: str = None):
+    """Rerank un staff derank automatiquement. Usage : -rerank @user <motif justifiant>"""
+    if not has_min_rank(ctx.author.id, 3):
+        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+    if not args:
+        return await ctx.send(embed=error_embed(
+            "Usage",
+            f"`{get_prefix_cached()}rerank <@user> <motif>`\n\n"
+            "Le motif doit justifier pourquoi le staff est réhabilité (min 10 caractères)."
+        ))
+
+    # Parse : premier mot = user, reste = motif
+    parts = args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return await ctx.send(embed=error_embed(
+            "❌ Motif manquant",
+            f"Usage : `{get_prefix_cached()}rerank <@user> <motif>`"
+        ))
+    user_part, motif = parts
+    motif = motif.strip()
+    if len(motif) < 10:
+        return await ctx.send(embed=error_embed(
+            "❌ Motif trop court",
+            "Le motif doit faire au moins **10 caractères** pour justifier le rerank."
+        ))
+
+    display, uid = await resolve_user_or_id(ctx, user_part)
     if uid is None:
         return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
-    if get_rank_db(uid) != 1:
-        return await ctx.send(embed=error_embed("Pas Helper", f"{format_user_display(display, uid)} n'est pas helper."))
-    set_rank_db(uid, 0)
-    await ctx.send(embed=success_embed("✅ Helper retiré", f"{format_user_display(display, uid)} n'est plus helper."))
-    await send_log(ctx.guild, "Helper retiré", ctx.author, display, uid, color=0xfaa61a)
+
+    # Check derniers derank non rerank
+    last = get_last_derank(uid, ctx.guild.id)
+    if not last:
+        return await ctx.send(embed=error_embed(
+            "❌ Aucun derank à rerank",
+            f"{format_user_display(display, uid)} n'a pas de derank en attente de rerank."
+        ))
+
+    # Rétablir le rôle
+    role_id = int(last["role_id"])
+    role = ctx.guild.get_role(role_id)
+    target_member = ctx.guild.get_member(uid)
+
+    if not target_member:
+        return await ctx.send(embed=error_embed(
+            "❌ Membre absent",
+            "Le staff n'est pas sur le serveur. Il faut qu'il revienne d'abord."
+        ))
+
+    if not role:
+        return await ctx.send(embed=error_embed(
+            "❌ Rôle supprimé",
+            f"Le rôle initial (`{role_id}`) n'existe plus sur le serveur."
+        ))
+
+    try:
+        await target_member.add_roles(role, reason=f"Rerank par {ctx.author} : {motif}")
+    except discord.Forbidden:
+        return await ctx.send(embed=error_embed("❌ Permission manquante", "Je ne peux pas ajouter ce rôle."))
+    except discord.HTTPException as e:
+        return await ctx.send(embed=error_embed("❌ Erreur Discord", str(e)))
+
+    record_rerank(last["id"], ctx.author.id, motif)
+
+    await ctx.send(embed=success_embed(
+        "✅ Rerank effectué",
+        f"{format_user_display(display, uid)} a récupéré le rôle {role.mention}.\n"
+        f"**Motif :** {motif}"
+    ))
+    await send_log(
+        ctx.guild, "Rerank", ctx.author, display, uid,
+        desc=f"Rôle restauré : {role.mention}\nDerank initial : #{last['id']}",
+        reason=motif, color=0x43b581,
+    )
+
+    # DM le staff
+    try:
+        em = discord.Embed(
+            title="✅ Tu as été rerank",
+            description=(
+                f"Sur le serveur **{ctx.guild.name}**.\n\n"
+                f"**Par :** {ctx.author.mention}\n"
+                f"**Motif :** {motif}\n\n"
+                f"Ton rôle **{role.name}** t'a été restauré."
+            ),
+            color=0x43b581,
+        )
+        em.set_footer(text="Sanction ・ Meira")
+        await target_member.send(embed=em)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 # ========================= BOT BAN =========================
@@ -1286,8 +2022,11 @@ async def check_escalation(ctx, target_display, target_id):
 async def _warn(ctx, user_input: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "warn")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -1305,9 +2044,14 @@ async def _warn(ctx, user_input: str = None, *, reason: str = None):
         return await ctx.send(embed=error_embed("❌ Raison requise", reason_or_err + f"\nUsage : `{get_prefix_cached()}warn @user <raison détaillée>`"))
     reason = reason_or_err
 
-    allowed, err = can_sanction_target(ctx.author.id, uid)
+    target_member = ctx.guild.get_member(uid)
+    allowed, err = can_sanction_target(ctx.author, target_member or uid)
     if not allowed:
         return await ctx.send(embed=error_embed("❌ Permission refusée", err))
+
+    # Check limite + derank auto si dépassement
+    if not await check_limit_or_derank(ctx, "warn"):
+        return
 
     sid = create_sanction(ctx.guild.id, uid, ctx.author.id, "warn", reason)
     warns_count = count_active_warns(ctx.guild.id, uid)
@@ -1321,7 +2065,6 @@ async def _warn(ctx, user_input: str = None, *, reason: str = None):
     ))
 
     # DM le warn à la cible
-    target_member = ctx.guild.get_member(uid)
     await notify_target_dm(target_member or display, ctx.guild, "warn", reason,
                            sanction_id=sid, moderator=ctx.author)
 
@@ -1336,8 +2079,11 @@ async def _warn(ctx, user_input: str = None, *, reason: str = None):
 async def _unwarn(ctx, sanction_id: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "unwarn")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not sanction_id:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
@@ -1352,9 +2098,8 @@ async def _unwarn(ctx, sanction_id: str = None, *, reason: str = None):
     if not sanc["active"]:
         return await ctx.send(embed=error_embed("Déjà révoqué", f"Le warn `#{sid}` est déjà inactif."))
 
-    # Un modo ne peut unwarn que ses propres warns (sauf Sys+)
-    author_rank = get_rank_db(ctx.author.id)
-    if author_rank < 3 and str(sanc["moderator_id"]) != str(ctx.author.id):
+    # Un staff ne peut unwarn que ses propres warns (sauf Sys+)
+    if not is_sys_or_buyer(ctx.author.id) and str(sanc["moderator_id"]) != str(ctx.author.id):
         return await ctx.send(embed=error_embed(
             "❌ Permission refusée",
             "Tu ne peux annuler que **tes propres** warns. Un Sys+ peut en annuler n'importe lequel."
@@ -1379,8 +2124,13 @@ async def _unwarn(ctx, sanction_id: str = None, *, reason: str = None):
 
 @bot.command(name="clearwarns")
 async def _clearwarns(ctx, *, user_input: str = None):
-    if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+    if await check_bot_ban(ctx):
+        return
+    ok, err_perm = await check_command_perm(ctx, "clearwarns")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
     display, uid = await resolve_user_or_id(ctx, user_input)
@@ -1405,8 +2155,11 @@ async def _clearwarns(ctx, *, user_input: str = None):
 async def _mute(ctx, user_input: str = None, duration: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "mute")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input or not duration:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -1426,14 +2179,6 @@ async def _mute(ctx, user_input: str = None, duration: str = None, *, reason: st
     if seconds == 0:
         return await ctx.send(embed=error_embed("❌ Durée invalide", "Un mute doit avoir une durée."))
 
-    # Check limite selon rang
-    author_rank = get_rank_db(ctx.author.id)
-    max_duration = MUTE_LIMITS.get(author_rank, 0)
-    if seconds > max_duration:
-        return await ctx.send(embed=error_embed(
-            "❌ Durée trop longue",
-            f"En tant que **{rank_name(author_rank)}**, tu peux mute jusqu'à **{format_duration(max_duration)}** max."
-        ))
     # Limite absolue Discord : 28 jours
     if seconds > 60 * 60 * 24 * 28:
         return await ctx.send(embed=error_embed(
@@ -1441,14 +2186,10 @@ async def _mute(ctx, user_input: str = None, duration: str = None, *, reason: st
             "La limite Discord pour un timeout est de **28 jours**."
         ))
 
-    ok, reason_or_err = validate_reason(reason)
-    if not ok:
+    ok_reason, reason_or_err = validate_reason(reason)
+    if not ok_reason:
         return await ctx.send(embed=error_embed("❌ Raison requise", reason_or_err + f"\nUsage : `{get_prefix_cached()}mute @user <durée> <raison détaillée>`"))
     reason = reason_or_err
-
-    allowed, err = can_sanction_target(ctx.author.id, uid)
-    if not allowed:
-        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
 
     target_member = ctx.guild.get_member(uid)
     if not target_member:
@@ -1456,6 +2197,14 @@ async def _mute(ctx, user_input: str = None, duration: str = None, *, reason: st
             "❌ Membre absent",
             f"{format_user_display(display, uid)} n'est pas sur le serveur. On ne peut pas mute quelqu'un qui n'est pas là."
         ))
+
+    allowed, err = can_sanction_target(ctx.author, target_member)
+    if not allowed:
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
+
+    # Check limite + derank
+    if not await check_limit_or_derank(ctx, "mute"):
+        return
 
     try:
         until = discord.utils.utcnow() + timedelta(seconds=seconds)
@@ -1487,8 +2236,11 @@ async def _mute(ctx, user_input: str = None, duration: str = None, *, reason: st
 async def _unmute(ctx, *, user_input: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "unmute")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
 
@@ -1533,8 +2285,11 @@ async def _unmute(ctx, *, user_input: str = None):
 async def _vmute(ctx, user_input: str = None, duration: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "vmute")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input or not duration:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -1553,26 +2308,21 @@ async def _vmute(ctx, user_input: str = None, duration: str = None, *, reason: s
     if seconds == 0:
         return await ctx.send(embed=error_embed("❌ Durée invalide", "Un vmute doit avoir une durée."))
 
-    author_rank = get_rank_db(ctx.author.id)
-    max_duration = MUTE_LIMITS.get(author_rank, 0)
-    if seconds > max_duration:
-        return await ctx.send(embed=error_embed(
-            "❌ Durée trop longue",
-            f"En tant que **{rank_name(author_rank)}**, tu peux vmute jusqu'à **{format_duration(max_duration)}** max."
-        ))
-
-    ok, reason_or_err = validate_reason(reason)
-    if not ok:
+    ok_reason, reason_or_err = validate_reason(reason)
+    if not ok_reason:
         return await ctx.send(embed=error_embed("❌ Raison requise", reason_or_err))
     reason = reason_or_err
-
-    allowed, err = can_sanction_target(ctx.author.id, uid)
-    if not allowed:
-        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
 
     target_member = ctx.guild.get_member(uid)
     if not target_member:
         return await ctx.send(embed=error_embed("❌ Membre absent", "Ce membre n'est pas sur le serveur."))
+
+    allowed, err = can_sanction_target(ctx.author, target_member)
+    if not allowed:
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
+
+    if not await check_limit_or_derank(ctx, "vmute"):
+        return
 
     try:
         await target_member.edit(mute=True, reason=f"{reason} | par {ctx.author}")
@@ -1600,8 +2350,11 @@ async def _vmute(ctx, user_input: str = None, duration: str = None, *, reason: s
 async def _unvmute(ctx, *, user_input: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "unvmute")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
 
@@ -1642,8 +2395,11 @@ async def _unvmute(ctx, *, user_input: str = None):
 async def _kick(ctx, user_input: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "kick")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -1656,14 +2412,10 @@ async def _kick(ctx, user_input: str = None, *, reason: str = None):
     if uid == ctx.author.id:
         return await ctx.send(embed=error_embed("❌ Erreur", "Tu ne peux pas te kick toi-même."))
 
-    ok, reason_or_err = validate_reason(reason)
-    if not ok:
+    ok_reason, reason_or_err = validate_reason(reason)
+    if not ok_reason:
         return await ctx.send(embed=error_embed("❌ Raison requise", reason_or_err))
     reason = reason_or_err
-
-    allowed, err = can_sanction_target(ctx.author.id, uid)
-    if not allowed:
-        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
 
     target_member = ctx.guild.get_member(uid)
     if not target_member:
@@ -1671,6 +2423,13 @@ async def _kick(ctx, user_input: str = None, *, reason: str = None):
             "❌ Membre absent",
             "Ce membre n'est pas sur le serveur. Il n'y a rien à kick."
         ))
+
+    allowed, err = can_sanction_target(ctx.author, target_member)
+    if not allowed:
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err))
+
+    if not await check_limit_or_derank(ctx, "kick"):
+        return
 
     # DM avant kick (sinon la personne peut plus recevoir)
     await notify_target_dm(target_member, ctx.guild, "kick", reason,
@@ -1706,8 +2465,11 @@ async def _ban(ctx, user_input: str = None, duration: str = None, *, reason: str
     """
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis pour ban."))
+    ok, err_perm = await check_command_perm(ctx, "ban")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -1735,17 +2497,21 @@ async def _ban(ctx, user_input: str = None, duration: str = None, *, reason: str
         return await ctx.send(embed=error_embed("❌ Durée invalide", err))
     # 0 = permanent (retourné par parse_duration pour "perm")
 
-    ok, reason_or_err = validate_reason(reason)
-    if not ok:
+    ok_reason, reason_or_err = validate_reason(reason)
+    if not ok_reason:
         return await ctx.send(embed=error_embed("❌ Raison requise", reason_or_err))
     reason = reason_or_err
 
-    allowed, err = can_sanction_target(ctx.author.id, uid)
+    # DM avant ban (si membre présent)
+    target_member = ctx.guild.get_member(uid)
+
+    allowed, err = can_sanction_target(ctx.author, target_member or uid)
     if not allowed:
         return await ctx.send(embed=error_embed("❌ Permission refusée", err))
 
-    # DM avant ban (si membre présent)
-    target_member = ctx.guild.get_member(uid)
+    if not await check_limit_or_derank(ctx, "ban"):
+        return
+
     if target_member:
         await notify_target_dm(target_member, ctx.guild, "ban", reason,
                                duration=seconds if seconds else None,
@@ -1778,8 +2544,11 @@ async def _ban(ctx, user_input: str = None, duration: str = None, *, reason: str
 async def _unban(ctx, user_input: str = None, *, reason: str = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis pour unban."))
+    ok, err_perm = await check_command_perm(ctx, "unban")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
@@ -1827,8 +2596,11 @@ async def _unsanction(ctx, sanction_id: str = None, *, reason: str = None):
     """Annule n'importe quelle sanction active (Sys+ sans restriction)."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "unsanction")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not sanction_id:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
@@ -1842,9 +2614,8 @@ async def _unsanction(ctx, sanction_id: str = None, *, reason: str = None):
     if not sanc["active"]:
         return await ctx.send(embed=error_embed("Déjà révoquée", f"La sanction `#{sid}` est déjà inactive."))
 
-    # Modo ne peut unsanction que ses propres sanctions
-    author_rank = get_rank_db(ctx.author.id)
-    if author_rank < 3 and str(sanc["moderator_id"]) != str(ctx.author.id):
+    # Un staff ne peut unsanction que ses propres sanctions (sauf Sys+)
+    if not is_sys_or_buyer(ctx.author.id) and str(sanc["moderator_id"]) != str(ctx.author.id):
         return await ctx.send(embed=error_embed(
             "❌ Permission refusée",
             "Tu ne peux annuler que **tes propres** sanctions. Un Sys+ peut en annuler n'importe laquelle."
@@ -1895,25 +2666,25 @@ async def _unsanction(ctx, sanction_id: str = None, *, reason: str = None):
 
 @bot.command(name="casier")
 async def _casier(ctx, *, user_input: str = None):
-    """Affiche le casier d'un membre. Sans argument : son propre casier."""
+    """Affiche le casier d'un membre (bot staff-only)."""
     if await check_bot_ban(ctx):
         return
 
-    # Sans argument : l'auteur voit son propre casier
+    # Bot staff-only
+    ok, err_perm = await check_command_perm(ctx, "casier")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
+
     if user_input is None:
-        target = ctx.author
-        uid = ctx.author.id
-        display = ctx.author
-    else:
-        if not has_min_rank(ctx.author.id, 1):
-            return await ctx.send(embed=error_embed(
-                "❌ Permission refusée",
-                f"**Helper+** requis pour voir le casier des autres.\n"
-                f"Tu peux voir **le tien** avec `{get_prefix_cached()}casier` (sans argument)."
-            ))
-        display, uid = await resolve_user_or_id(ctx, user_input)
-        if uid is None:
-            return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
+        return await ctx.send(embed=error_embed(
+            "Argument manquant",
+            f"Usage : `{get_prefix_cached()}casier <@user|id|nom>`"
+        ))
+    display, uid = await resolve_user_or_id(ctx, user_input)
+    if uid is None:
+        return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
 
     sanctions = get_user_sanctions(ctx.guild.id, uid, active_only=False)
     if not sanctions:
@@ -1971,8 +2742,11 @@ async def _sanction(ctx, sanction_id: str = None):
     """Affiche le détail d'une sanction précise."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "sanction")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not sanction_id:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
@@ -2019,9 +2793,14 @@ async def _sanction(ctx, sanction_id: str = None):
 
 @bot.command(name="resetcasier")
 async def _resetcasier(ctx, *, user_input: str = None):
-    """Wipe complet du casier d'un membre. Action drastique, Sys+ requis."""
-    if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+    """Wipe complet du casier d'un membre. Action drastique."""
+    if await check_bot_ban(ctx):
+        return
+    ok, err_perm = await check_command_perm(ctx, "resetcasier")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
     display, uid = await resolve_user_or_id(ctx, user_input)
@@ -2145,30 +2924,35 @@ async def antiraid_check_join(member):
 
 # ========================= PURGE =========================
 
-@bot.command(name="purge")
-async def _purge(ctx, count: int = None, *, user_input: str = None):
+@bot.command(name="clear", aliases=["purge"])
+async def _clear(ctx, count: int = None, *, user_input: str = None):
     """
     Supprime les N derniers messages. Optionnel : filtrer par user.
-    -purge 50          → 50 derniers messages
-    -purge 50 @user    → 50 derniers messages de @user
+    -clear 50          → 50 derniers messages
+    -clear 50 @user    → 50 derniers messages de @user
     """
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "clear")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if count is None or count <= 0:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
-            f"Usage : `{get_prefix_cached()}purge <nombre> [@user]`"
+            f"Usage : `{get_prefix_cached()}clear <nombre> [@user]`"
         ))
 
-    author_rank = get_rank_db(ctx.author.id)
-    max_count = PURGE_LIMITS.get(author_rank, 20)
-    if count > max_count:
+    # Plafond max pour éviter les catastrophes (200 messages max pour tous, Sys+ exclu)
+    if not is_sys_or_buyer(ctx.author.id) and count > 200:
         return await ctx.send(embed=error_embed(
-            "❌ Limite dépassée",
-            f"En tant que **{rank_name(author_rank)}**, tu peux purger jusqu'à **{max_count}** messages max."
+            "❌ Limite de sécurité",
+            "Max **200 messages** par commande pour éviter les accidents. Sys+ bypass."
         ))
+
+    if not await check_limit_or_derank(ctx, "clear"):
+        return
 
     # Résolution du filtre user si fourni
     target_id = None
@@ -2221,8 +3005,11 @@ async def _lock(ctx, channel: discord.TextChannel = None, *, reason: str = None)
     """Lock le salon courant (ou celui spécifié). Retire send_messages à @everyone."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "lock")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
 
     ch = channel or ctx.channel
     ok, reason_or_err = validate_reason(reason)
@@ -2256,8 +3043,11 @@ async def _lock(ctx, channel: discord.TextChannel = None, *, reason: str = None)
 async def _unlock(ctx, channel: discord.TextChannel = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "unlock")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
 
     ch = channel or ctx.channel
 
@@ -2281,8 +3071,11 @@ async def _unlock(ctx, channel: discord.TextChannel = None):
 async def _slowmode(ctx, duration: str = None, channel: discord.TextChannel = None):
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "slowmode")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if duration is None:
         return await ctx.send(embed=error_embed(
             "Argument manquant",
@@ -2333,8 +3126,11 @@ async def _note(ctx, user_input: str = None, *, content: str = None):
     """Ajoute une note privée staff sur un membre."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis pour ajouter une note."))
+    ok, err_perm = await check_command_perm(ctx, "note")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input or not content:
         return await ctx.send(embed=error_embed(
             "Arguments manquants",
@@ -2365,8 +3161,11 @@ async def _notes(ctx, *, user_input: str = None):
     """Affiche les notes staff sur un membre."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "notes")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if not user_input:
         return await ctx.send(embed=error_embed("Argument manquant", "Mention, ID ou nom requis."))
     display, uid = await resolve_user_or_id(ctx, user_input)
@@ -2403,8 +3202,11 @@ async def _delnote(ctx, note_id: int = None):
     """Supprime une note staff par son ID."""
     if await check_bot_ban(ctx):
         return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
+    ok, err_perm = await check_command_perm(ctx, "delnote")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
     if note_id is None:
         return await ctx.send(embed=error_embed("Argument manquant", f"Usage : `{get_prefix_cached()}delnote <id>`"))
 
@@ -2417,198 +3219,6 @@ async def _delnote(ctx, note_id: int = None):
 
 
 # ========================= APPELS =========================
-
-@bot.command(name="appel")
-async def _appel(ctx, sanction_id: str = None, *, motif: str = None):
-    """Un membre conteste une sanction reçue."""
-    if await check_bot_ban(ctx):
-        return
-    if not sanction_id:
-        return await ctx.send(embed=error_embed(
-            "Arguments manquants",
-            f"Usage : `{get_prefix_cached()}appel <id_sanction> <motif>`\n"
-            f"Ex : `{get_prefix_cached()}appel A7F3 Je pense que le warn est injuste parce que...`"
-        ))
-
-    sid = sanction_id.upper().lstrip("#")
-    sanc = get_sanction(sid)
-    if not sanc:
-        return await ctx.send(embed=error_embed("❌ Sanction introuvable", f"Aucune sanction avec l'ID `#{sid}`."))
-    if str(sanc["target_id"]) != str(ctx.author.id):
-        return await ctx.send(embed=error_embed(
-            "❌ Pas ta sanction",
-            "Tu ne peux faire appel que pour tes propres sanctions."
-        ))
-    if not sanc["active"]:
-        return await ctx.send(embed=error_embed(
-            "Sanction déjà résolue",
-            f"La sanction `#{sid}` est déjà inactive, pas besoin de faire appel."
-        ))
-
-    if not motif or len(motif.strip()) < 10:
-        return await ctx.send(embed=error_embed(
-            "❌ Motif trop court",
-            "Explique en détail (**minimum 10 caractères**) pourquoi tu contestes cette sanction.\n"
-            "Un bon motif aide le staff à trancher équitablement."
-        ))
-    motif = motif.strip()
-
-    if user_has_pending_appeal(ctx.author.id, sid):
-        return await ctx.send(embed=error_embed(
-            "❌ Appel en cours",
-            f"Tu as déjà un appel en attente pour la sanction `#{sid}`. Patiente que le staff le traite."
-        ))
-
-    appeal_id = create_appeal(sid, ctx.guild.id, ctx.author.id, motif)
-
-    await ctx.send(embed=success_embed(
-        "📨 Appel envoyé",
-        f"Ton appel pour la sanction `#{sid}` a été transmis au staff.\n"
-        f"ID de ton appel : `#{appeal_id}`\n\n"
-        f"Tu recevras une notification par DM quand il sera traité."
-    ))
-    await send_log(ctx.guild, "Nouvel appel", ctx.author, ctx.author, ctx.author.id,
-                   desc=f"Appel `#{appeal_id}` sur sanction `#{sid}`",
-                   reason=motif[:200] + ("…" if len(motif) > 200 else ""),
-                   color=0x3498db)
-
-
-@bot.command(name="appels")
-async def _appels(ctx):
-    """Liste des appels en attente (Modo+)."""
-    if await check_bot_ban(ctx):
-        return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
-
-    pending = get_pending_appeals(ctx.guild.id)
-    if not pending:
-        return await ctx.send(embed=info_embed("📨 Aucun appel", "Aucun appel en attente."))
-
-    lines = []
-    for a in pending[:10]:
-        created = format_datetime(a["created_at"])
-        motif_short = a["motif"][:150] + ("…" if len(a["motif"]) > 150 else "")
-        lines.append(
-            f"**Appel `#{a['id']}`** ・ {created}\n"
-            f"   ↳ Sanction : `#{a['sanction_id']}`\n"
-            f"   ↳ Par : <@{a['user_id']}>\n"
-            f"   ↳ Motif : *{motif_short}*"
-        )
-
-    em = discord.Embed(
-        title=f"📨 Appels en attente ({len(pending)})",
-        description="\n\n".join(lines) + f"\n\nUtilise `{get_prefix_cached()}traiter <id> accept/reject <motif>` pour trancher.",
-        color=0x3498db,
-    )
-    if len(pending) > 10:
-        em.set_footer(text=f"10 affichés sur {len(pending)}")
-    await ctx.send(embed=em)
-
-
-@bot.command(name="traiter")
-async def _traiter(ctx, appeal_id: int = None, decision: str = None, *, reason: str = None):
-    """Traite un appel : accept ou reject, avec motif."""
-    if await check_bot_ban(ctx):
-        return
-    if not has_min_rank(ctx.author.id, 2):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Modérateur+** requis."))
-    if appeal_id is None or decision is None:
-        return await ctx.send(embed=error_embed(
-            "Arguments manquants",
-            f"Usage : `{get_prefix_cached()}traiter <id_appel> accept/reject <motif>`"
-        ))
-
-    decision = decision.lower()
-    if decision not in ("accept", "reject", "accepter", "refuser"):
-        return await ctx.send(embed=error_embed(
-            "❌ Décision invalide", "Utilise `accept` ou `reject`."
-        ))
-    if decision in ("accepter",):
-        decision = "accept"
-    elif decision in ("refuser",):
-        decision = "reject"
-
-    ok, reason_or_err = validate_reason(reason)
-    if not ok:
-        return await ctx.send(embed=error_embed("❌ Motif requis", reason_or_err + "\n(Un motif clair aide le membre à comprendre la décision.)"))
-    reason = reason_or_err
-
-    appeal = get_appeal(appeal_id)
-    if not appeal:
-        return await ctx.send(embed=error_embed("❌ Appel introuvable", f"Aucun appel `#{appeal_id}`."))
-    if appeal["status"] != "pending":
-        return await ctx.send(embed=error_embed(
-            "Déjà traité",
-            f"Cet appel a déjà été traité (**{appeal['status']}**)."
-        ))
-
-    status = "accepted" if decision == "accept" else "rejected"
-    if not handle_appeal(appeal_id, status, ctx.author.id, reason):
-        return await ctx.send(embed=error_embed("❌ Erreur", "Impossible de traiter cet appel."))
-
-    # Si accepté : on révoque la sanction
-    if decision == "accept":
-        sid = appeal["sanction_id"]
-        sanc = get_sanction(sid)
-        target_id = int(appeal["user_id"])
-        if sanc and sanc["active"]:
-            # Applique le déblocage Discord selon le type
-            stype = sanc["type"]
-            target_member = ctx.guild.get_member(target_id)
-            try:
-                if stype == "mute" and target_member:
-                    try:
-                        await target_member.timeout(None, reason=f"Appel accepté par {ctx.author}")
-                    except discord.HTTPException:
-                        pass
-                elif stype == "vmute" and target_member:
-                    try:
-                        await target_member.edit(mute=False, reason=f"Appel accepté par {ctx.author}")
-                    except discord.HTTPException:
-                        pass
-                elif stype == "ban":
-                    try:
-                        await ctx.guild.unban(discord.Object(id=target_id),
-                                              reason=f"Appel accepté par {ctx.author}")
-                    except (discord.NotFound, discord.HTTPException):
-                        pass
-            except Exception as e:
-                log.warning(f"Erreur déblocage suite à appel accepté : {e}")
-
-            revoke_sanction(sid, ctx.author.id, f"Appel #{appeal_id} accepté : {reason}")
-
-    # Notif DM au membre
-    user_id = int(appeal["user_id"])
-    try:
-        user_obj = await bot.fetch_user(user_id)
-        color = 0x43b581 if decision == "accept" else 0xf04747
-        title = "✅ Ton appel a été accepté" if decision == "accept" else "❌ Ton appel a été refusé"
-        em = discord.Embed(title=title, color=color)
-        em.add_field(name="Sanction concernée", value=f"`#{appeal['sanction_id']}`", inline=True)
-        em.add_field(name="Serveur", value=ctx.guild.name, inline=True)
-        em.add_field(name="Motif de la décision", value=reason, inline=False)
-        em.set_footer(text="Sanction ・ Meira")
-        await user_obj.send(embed=em)
-    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-        pass
-
-    emoji = "✅" if decision == "accept" else "❌"
-    action_word = "accepté" if decision == "accept" else "refusé"
-    await ctx.send(embed=success_embed(
-        f"{emoji} Appel {action_word}",
-        f"Appel `#{appeal_id}` **{action_word}**.\n"
-        f"Sanction concernée : `#{appeal['sanction_id']}`\n"
-        f"**Motif :** {reason}" +
-        ("\n\nLa sanction a été révoquée." if decision == "accept" else "")
-    ))
-    await send_log(
-        ctx.guild, f"Appel {action_word}", ctx.author,
-        desc=f"Appel `#{appeal_id}` sur sanction `#{appeal['sanction_id']}`",
-        reason=reason,
-        color=0x43b581 if decision == "accept" else 0xf04747,
-    )
-
 
 # ========================= ANTI-RAID =========================
 
@@ -2675,8 +3285,11 @@ async def _antiraid(ctx, action: str = None, *, value: str = None):
     -antiraid action timeout|kick → action
     -antiraid duration 3600 → durée timeout en secondes
     """
+    # Sys+ uniquement (pas dans le système de perms, reste admin)
     if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+        if get_member_perm_level(ctx.author) == 0:
+            return  # silencieux
+        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis pour l'anti-raid."))
 
     cfg = get_antiraid()
 
@@ -2760,7 +3373,9 @@ async def _escalation(ctx, action: str = None, *args):
     -escalation clear        → vide (désactive l'escalation)
     """
     if not has_min_rank(ctx.author.id, 3):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+        if get_member_perm_level(ctx.author) == 0:
+            return  # silencieux
+        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis pour l'escalation."))
 
     rules = get_escalation()
     p = get_prefix_cached()
@@ -2804,20 +3419,19 @@ async def _escalation(ctx, action: str = None, *args):
 
 @bot.command(name="modstats")
 async def _modstats(ctx, *, user_input: str = None):
-    """Stats de modération d'un modérateur (soi-même par défaut)."""
-    if not has_min_rank(ctx.author.id, 1):
-        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Helper+** requis."))
+    """Stats de modération d'un staff (soi-même par défaut)."""
+    if await check_bot_ban(ctx):
+        return
+    ok, err_perm = await check_command_perm(ctx, "modstats")
+    if not ok:
+        if err_perm == "__SILENT__":
+            return
+        return await ctx.send(embed=error_embed("❌ Permission refusée", err_perm))
 
     if user_input is None:
         target = ctx.author
         uid = ctx.author.id
     else:
-        if not has_min_rank(ctx.author.id, 2):
-            return await ctx.send(embed=error_embed(
-                "❌ Permission refusée",
-                f"**Modérateur+** requis pour voir les stats des autres.\n"
-                f"Tu peux voir **tes** stats avec `{get_prefix_cached()}modstats` (sans argument)."
-            ))
         target, uid = await resolve_user_or_id(ctx, user_input)
         if uid is None:
             return await ctx.send(embed=error_embed("❌ Utilisateur introuvable", "Mention, ID ou nom requis."))
@@ -2852,138 +3466,173 @@ async def _modstats(ctx, *, user_input: str = None):
     await ctx.send(embed=em)
 
 
-# ========================= HELP DYNAMIQUE =========================
+# ========================= HELP (STAFF-ONLY) =========================
+#
+# Deux commandes :
+#  -help    → vue d'ensemble catégorisée (comme avant, mais staff-only)
+#  -helpall → vue paginée par niveau de perm (boutons ← →)
+#
+# Membre lambda sans rôle → refus silencieux total
 
-HELP_CATEGORIES = {
-    "perso": {
-        "emoji": "👤",
-        "label": "Perso",
-        "title": "👤  Perso",
-        "items": [
-            ("casier",                    "Voir ton propre casier",           0),
-            ("appel <id> <motif>",        "Contester une sanction reçue",     0),
-        ],
-    },
-    "sanctions_light": {
+
+# --- Mapping des commandes aux catégories pour le -help standard ---
+# Les items du help sont DYNAMIQUES : la perm affichée à droite vient de get_cmd_perms()
+HELP_CATEGORIES_V2 = {
+    "moderation": {
         "emoji": "⚠️",
-        "label": "Sanctions (Helper+)",
-        "title": "⚠️  Sanctions — Helper+",
-        "items": [
-            ("warn @user <raison>",       "Avertir (déclenche escalation)",   1),
-            ("mute @user <durée> <r>",    "Mute textuel (max 1h Helper)",     1),
-            ("vmute @user <durée> <r>",   "Mute vocal (max 1h Helper)",       1),
-            ("casier @user",              "Voir le casier d'un membre",       1),
-            ("sanction <id>",             "Détail d'une sanction",            1),
-            ("notes @user",               "Lire les notes staff",             1),
-            ("modstats",                  "Tes propres stats de modération",  1),
+        "label": "Modération",
+        "title": "⚠️  Modération",
+        "commands": [
+            ("warn @user <raison>",            "Avertir (déclenche escalation)", "warn"),
+            ("mute @user <durée> <raison>",    "Mute textuel (timeout Discord)", "mute"),
+            ("vmute @user <durée> <raison>",   "Mute vocal",                     "vmute"),
+            ("unmute @user",                   "Retirer un mute",                "unmute"),
+            ("unvmute @user",                  "Retirer un vmute",               "unvmute"),
+            ("kick @user <raison>",            "Expulser du serveur",            "kick"),
+            ("ban @user <durée|perm> <r>",     "Bannir (temp ou perm)",          "ban"),
+            ("unban <id|mention> [raison]",    "Débannir",                       "unban"),
+            ("unwarn <id> [raison]",           "Annuler un warn",                "unwarn"),
+            ("unsanction <id> [raison]",       "Annuler toute sanction",         "unsanction"),
+            ("clearwarns @user",               "Effacer tous les warns",         "clearwarns"),
+            ("resetcasier @user",              "Wipe complet du casier",         "resetcasier"),
         ],
     },
-    "sanctions_mid": {
-        "emoji": "🔨",
-        "label": "Sanctions (Modo+)",
-        "title": "🔨  Sanctions — Modérateur+",
-        "items": [
-            ("kick @user <raison>",       "Expulser du serveur",              2),
-            ("mute @user <durée> <r>",    "Mute textuel (max 24h Modo)",      2),
-            ("vmute @user <durée> <r>",   "Mute vocal (max 24h Modo)",        2),
-            ("unmute @user",              "Retirer un mute",                  2),
-            ("unvmute @user",             "Retirer un vmute",                 2),
-            ("unwarn <id> [raison]",      "Annuler un warn (le tien)",        2),
-            ("unsanction <id> [raison]",  "Annuler une sanction (la tienne)", 2),
-            ("modstats @mod",             "Stats d'un autre modo",            2),
-        ],
-    },
-    "sanctions_hard": {
-        "emoji": "⛔",
-        "label": "Sanctions (Sys+)",
-        "title": "⛔  Sanctions — Sys+",
-        "items": [
-            ("ban @user perm <raison>",      "Ban permanent",                   3),
-            ("ban @user <durée> <raison>",   "Ban temporaire (déban auto)",     3),
-            ("unban <id/mention> [raison]",  "Débannir",                        3),
-            ("mute @user <durée> <r>",       "Mute textuel (max 28j Sys)",      3),
-            ("unsanction <id> (n'importe)",  "Annuler toute sanction",          3),
-            ("clearwarns @user",             "Effacer tous les warns",          3),
-            ("resetcasier @user",            "Wipe complet du casier",          3),
+    "casier": {
+        "emoji": "📋",
+        "label": "Casier",
+        "title": "📋  Casier & info",
+        "commands": [
+            ("casier @user",                   "Voir le casier d'un membre",     "casier"),
+            ("sanction <id>",                  "Détail d'une sanction",          "sanction"),
+            ("notes @user",                    "Lire les notes staff",           "notes"),
+            ("note @user <contenu>",           "Ajouter une note staff",         "note"),
+            ("delnote <id>",                   "Supprimer une note",             "delnote"),
+            ("modstats [@user]",               "Stats de modération",            "modstats"),
         ],
     },
     "utilitaires": {
         "emoji": "🛠️",
         "label": "Utilitaires",
         "title": "🛠️  Utilitaires",
-        "items": [
-            ("purge <n>",          "Supprimer n messages (max 20 Helper, 100 Modo, 500 Sys)",  1),
-            ("purge <n> @user",    "Messages ciblés (Modo+)",                 2),
-            ("slowmode <durée>",   "Slowmode du salon (0 pour off)",          1),
-            ("lock [#salon] <r>",  "Verrouiller un salon",                    2),
-            ("unlock [#salon]",    "Déverrouiller",                           2),
+        "commands": [
+            ("clear <n> [@user]",              "Supprimer n messages (ex-purge)","clear"),
+            ("slowmode <durée> [#salon]",      "Slowmode (0 pour off)",          "slowmode"),
+            ("lock [#salon] <raison>",         "Verrouiller un salon",           "lock"),
+            ("unlock [#salon]",                "Déverrouiller",                  "unlock"),
         ],
     },
-    "notes_appels": {
-        "emoji": "📝",
-        "label": "Notes & Appels",
-        "title": "📝  Notes & Appels",
-        "items": [
-            ("note @user <contenu>",   "Ajouter une note staff privée",       2),
-            ("notes @user",            "Lire les notes d'un membre",          1),
-            ("delnote <id>",           "Supprimer une note",                  2),
-            ("appels",                 "Lister les appels en attente",        2),
-            ("traiter <id> accept/reject <motif>", "Trancher un appel",       2),
+    "mes_limites": {
+        "emoji": "⏱️",
+        "label": "Mes limites",
+        "title": "⏱️  Mes limites",
+        "commands": [
+            ("mylimits",                       "Voir tes quotas restants",       "mylimits"),
         ],
     },
-    "perms": {
-        "emoji": "👥",
-        "label": "Permissions",
-        "title": "👥  Permissions",
-        "items": [
-            ("helper @u / unhelper @u",  "Gérer les Helpers",          3),
-            ("mod @u / unmod @u",        "Gérer les Modérateurs",      3),
-            ("sys @u / unsys @u",        "Gérer les Sys",              4),
-            ("botban @u / botunban @u",  "Ban/unban du bot",           3),
+    "perms_admin": {
+        "emoji": "🎚️",
+        "label": "Perms (Sys+)",
+        "title": "🎚️  Système de perms — Sys+",
+        "sys_only": True,
+        "commands_flat": [
+            ("setperm @role <1-9>",             "Attribuer un niveau de perm à un rôle"),
+            ("unsetperm @role",                 "Retirer le niveau d'un rôle"),
+            ("perms",                           "Liste des rôles configurés"),
+            ("setcmdperm <cmd> <niveau>",       "Ranger une commande dans un niveau"),
+            ("cmdperms",                        "Liste des commandes par niveau"),
+            ("setlimit <cmd> <lvl> <max> <min>","Limite par commande et niveau"),
+            ("unsetlimit <cmd> <lvl>",          "Retirer une limite (illimité)"),
+            ("limits",                          "Voir toutes les limites"),
+            ("rerank @user <motif>",            "Rerank après dépassement (motif 10+)"),
         ],
     },
-    "system": {
+    "config": {
         "emoji": "⚙️",
-        "label": "Système",
-        "title": "⚙️  Système",
-        "items": [
-            ("allow #salon / unallow #salon", "Gérer les salons autorisés", 3),
-            ("allow",                         "Lister les salons autorisés", 3),
-            ("escalation",                    "Config auto-escalation",     3),
-            ("antiraid",                      "Config anti-raid",           3),
-            ("setlog #salon",                 "Salon de logs",              4),
-            ("prefix [nouveau]",              "Changer le prefix",          4),
+        "label": "Config (Sys+)",
+        "title": "⚙️  Configuration — Sys+",
+        "sys_only": True,
+        "commands_flat": [
+            ("allow #salon",                    "Autoriser un salon"),
+            ("unallow #salon",                  "Retirer un salon autorisé"),
+            ("allow",                           "Lister les salons autorisés"),
+            ("antiraid [on|off|threshold|...]", "Config anti-raid"),
+            ("escalation [reset|clear]",        "Config auto-escalation"),
+            ("botban @u / botunban @u",         "Ban/unban du bot"),
+        ],
+    },
+    "buyer": {
+        "emoji": "👑",
+        "label": "Buyer",
+        "title": "👑  Buyer (config ultime)",
+        "buyer_only": True,
+        "commands_flat": [
+            ("sys @u / unsys @u",               "Gérer les Sys"),
+            ("setlog #salon",                   "Salon de logs"),
+            ("prefix [nouveau]",                "Changer le prefix"),
         ],
     },
     "hierarchy": {
         "emoji": "📋",
         "label": "Hiérarchie",
-        "title": "📋  Hiérarchie",
-        "min_rank": 0,  # Visible pour tout le monde (même rang 0)
-        "items": [],
+        "title": "📋  Hiérarchie & fonctionnement",
+        "always_visible_for_staff": True,
+        "commands": [],
     },
 }
 
 
-def help_accessible_items(key, rank):
-    cat = HELP_CATEGORIES.get(key, {})
-    return [(s, d) for (s, d, mr) in cat.get("items", []) if rank >= mr]
+def user_access_cmd(ctx_author, command):
+    """Retourne True si le user peut accéder à cette commande (sans check des limites)."""
+    if is_sys_or_buyer(ctx_author.id):
+        return True
+    required = get_cmd_perm(command)
+    if required is None:
+        return False
+    return get_member_perm_level(ctx_author) >= required
 
 
-def help_category_visible(key, rank):
-    cat = HELP_CATEGORIES.get(key, {})
-    if "min_rank" in cat:
-        return rank >= cat["min_rank"]
-    return len(help_accessible_items(key, rank)) > 0
+def help_v2_accessible_items(category_key, ctx_author):
+    """Retourne les items accessibles à un user pour cette catégorie."""
+    cat = HELP_CATEGORIES_V2.get(category_key, {})
+    items = []
+
+    # Catégories admin (sys_only/buyer_only/commands_flat) : on check par rang
+    if cat.get("sys_only"):
+        if not is_sys_or_buyer(ctx_author.id):
+            return []
+        return [(syntax, desc) for syntax, desc in cat.get("commands_flat", [])]
+    if cat.get("buyer_only"):
+        if get_rank_db(ctx_author.id) < 4:
+            return []
+        return [(syntax, desc) for syntax, desc in cat.get("commands_flat", [])]
+
+    # Catégories standard (commands avec clé de cmd_perm)
+    for entry in cat.get("commands", []):
+        syntax, desc, cmd_key = entry
+        if user_access_cmd(ctx_author, cmd_key):
+            items.append((syntax, desc))
+    return items
 
 
-def build_help_category_embed(key, rank):
+def help_v2_category_visible(category_key, ctx_author):
+    cat = HELP_CATEGORIES_V2.get(category_key, {})
+    if cat.get("always_visible_for_staff"):
+        # Visible si staff
+        return is_sys_or_buyer(ctx_author.id) or get_member_perm_level(ctx_author) > 0
+    return len(help_v2_accessible_items(category_key, ctx_author)) > 0
+
+
+def build_help_category_embed_v2(category_key, ctx_author):
     p = get_prefix_cached()
-    cat = HELP_CATEGORIES[key]
+    cat = HELP_CATEGORIES_V2[category_key]
+
+    if category_key == "hierarchy":
+        return build_help_hierarchy_embed_v2(ctx_author)
+
     em = discord.Embed(title=cat["title"], color=embed_color())
-    items = help_accessible_items(key, rank)
+    items = help_v2_accessible_items(category_key, ctx_author)
     if not items:
-        em.description = "*Aucune commande accessible à ton rang.*"
+        em.description = "*Aucune commande accessible à ton niveau de perm.*"
     else:
         max_syntax = max(len(f"{p}{syntax}") for syntax, _ in items)
         lines = [
@@ -2995,74 +3644,106 @@ def build_help_category_embed(key, rank):
     return em
 
 
-def build_help_hierarchy_embed(rank):
-    em = discord.Embed(title="📋  Hiérarchie", color=embed_color())
-    lines = ["```\nBuyer > Sys > Modérateur > Helper > Aucun\n```\n"]
-    levels = [
-        (4, "👑 **Buyer**",       "`-prefix`, `-setlog`, `-sys`/`-unsys`. Accès total."),
-        (3, "🔧 **Sys**",         "Ban, unban, mute max 28j, `-mod`/`-unmod`, `-helper`/`-unhelper`, antiraid, escalation, `-allow`/`-unallow`, `-botban`, `-resetcasier`"),
-        (2, "⚠️ **Modérateur**",   "Kick, mute max 24h, unmute, unsanction propres, purge max 100, lock, notes, appels, traiter"),
-        (1, "✨ **Helper**",      "Warn, mute max 1h, vmute max 1h, purge max 20, slowmode, casier, sanction, lire notes"),
-        (0, "👤 **Aucun**",       "Son propre `-casier` et faire `-appel`"),
-    ]
-    for lvl, name, desc in levels:
-        marker = " ← **toi**" if lvl == rank else ""
-        lines.append(f"> {name} — {desc}{marker}")
+def build_help_hierarchy_embed_v2(ctx_author):
+    em = discord.Embed(title="📋  Hiérarchie & fonctionnement", color=embed_color())
+    rank = get_rank_db(ctx_author.id)
+    member_perm = get_member_perm_level(ctx_author)
+
+    lines = []
+    lines.append("**🏛️  Système de rangs DB**")
+    lines.append("```\nBuyer > Sys > (staff = rôles+perms)\n```")
+
+    if rank == 4:
+        lines.append("> 👑 **Buyer** ← toi — Config ultime, bypass total")
+    elif rank == 3:
+        lines.append("> 👑 Buyer — Config ultime, bypass total")
+        lines.append("> 🔧 **Sys** ← toi — Bypass tout (perms et limites), gère le système de perms")
+    else:
+        lines.append("> 👑 Buyer — Config ultime, bypass total")
+        lines.append("> 🔧 Sys — Bypass tout, gère le système de perms")
     lines.append("")
-    lines.append("ℹ️ Un rang ne peut **jamais** sanctionner un rang égal ou supérieur.")
+    lines.append("**🎚️  Niveaux de perm (1-9)** — configurés par Sys+")
+    lines.append("Les rôles Discord sont assignés à un niveau de perm.")
+    lines.append("Chaque commande de modération a un niveau requis.")
+    lines.append("Avoir le rôle perm X → accès à toutes les cmds de perm ≤ X.")
+    lines.append("")
+    if rank < 3 and member_perm > 0:
+        lines.append(f"> **Ton niveau actuel : perm {member_perm}**")
+        lines.append(f"> Tu peux utiliser toutes les commandes de perm 1 à {member_perm}.")
+        lines.append(f"> Utilise `{get_prefix_cached()}helpall` pour voir ce que tu as accès.")
+    elif rank >= 3:
+        lines.append(f"> Tu es **{rank_name(rank)}** — bypass total")
+    lines.append("")
+    lines.append("**⏱️  Limites et derank auto**")
+    lines.append("Chaque commande a une limite **X actions par Y minutes** (configurable).")
+    lines.append("Dépasser la limite = **retrait automatique du rôle perm concerné** + DM.")
+    lines.append("Demande un rerank à un Sys+ en justifiant ton acte.")
+    lines.append("Sys/Buyer ne sont **jamais** limités.")
+
     em.description = "\n".join(lines)
     em.set_footer(text="Sanction ・ Meira")
     return em
 
 
-def build_help_home_embed(rank):
+def build_help_home_embed_v2(ctx_author):
     p = get_prefix_cached()
     em = discord.Embed(color=embed_color())
-    em.set_author(name="Sanction ─ Panel d'aide")
+    em.set_author(name="Sanction ─ Panel d'aide staff")
 
-    rank_label = rank_name(rank)
+    rank = get_rank_db(ctx_author.id)
+    member_perm = get_member_perm_level(ctx_author)
+
+    if is_sys_or_buyer(ctx_author.id):
+        status_line = f"**Ton rang :** {rank_name(rank)} ・ Accès total (bypass)"
+    elif member_perm > 0:
+        status_line = f"**Ton niveau de perm :** {member_perm} / {MAX_PERM_LEVEL}"
+    else:
+        status_line = "**Aucun accès au bot.**"
+
     intro = (
         f"```\n🕐  {get_french_time()}\n```\n"
-        f"Bienvenue sur **Sanction**, le bot de modération de Meira.\n\n"
-        f"**Prefix :** `{p}` ・ **Ton rang :** {rank_label}\n\n"
+        f"**Sanction** — bot de modération staff-only.\n\n"
+        f"**Prefix :** `{p}` ・ {status_line}\n\n"
     )
 
-    category_descriptions = {
-        "perso":           "Ton casier & faire appel d'une sanction",
-        "sanctions_light": "Warn, mute, vmute",
-        "sanctions_mid":   "Kick, unmute, purge, lock",
-        "sanctions_hard":  "Ban, clearwarns, resetcasier",
-        "utilitaires":     "Purge, lock, slowmode",
-        "notes_appels":    "Notes staff privées & appels",
-        "perms":           "Attribuer les rangs",
-        "system":          "Configuration du bot",
-        "hierarchy":       "Qui peut faire quoi",
+    category_descs = {
+        "moderation":  "Warn, mute, kick, ban, unsanction",
+        "casier":      "Casier, sanctions, notes, modstats",
+        "utilitaires": "Clear, lock, unlock, slowmode",
+        "mes_limites": "Tes quotas restants",
+        "perms_admin": "Gérer le système de perms (Sys+)",
+        "config":      "Anti-raid, escalation, salons (Sys+)",
+        "buyer":       "Prefix, setlog, sys/unsys (Buyer)",
+        "hierarchy":   "Comment ça marche",
     }
     visible = []
-    for key, lbl in category_descriptions.items():
-        if help_category_visible(key, rank):
-            cat = HELP_CATEGORIES[key]
-            visible.append(f"> {cat['emoji']} **{cat['label']}** — {lbl}")
+    for key, desc in category_descs.items():
+        if help_v2_category_visible(key, ctx_author):
+            cat = HELP_CATEGORIES_V2[key]
+            visible.append(f"> {cat['emoji']} **{cat['label']}** — {desc}")
 
     em.description = intro + ("\n".join(visible) if visible else "*Aucune catégorie disponible.*")
+    em.add_field(
+        name="💡 Astuce",
+        value=f"Utilise `{p}helpall` pour un affichage **paginé par niveau de perm**.",
+        inline=False,
+    )
     em.set_footer(text="Sanction ・ Meira")
     return em
 
 
-def build_help_embed_for(key, rank):
+def build_help_embed_for_v2(key, ctx_author):
     if key == "home":
-        return build_help_home_embed(rank)
-    if key == "hierarchy":
-        return build_help_hierarchy_embed(rank)
-    return build_help_category_embed(key, rank)
+        return build_help_home_embed_v2(ctx_author)
+    return build_help_category_embed_v2(key, ctx_author)
 
 
-class HelpDropdown(discord.ui.Select):
-    def __init__(self, user_rank):
-        self.user_rank = user_rank
+class HelpDropdownV2(discord.ui.Select):
+    def __init__(self, ctx_author):
+        self.ctx_author = ctx_author
         options = [discord.SelectOption(label="Accueil", emoji="🏠", value="home")]
-        for key, cat in HELP_CATEGORIES.items():
-            if help_category_visible(key, user_rank):
+        for key, cat in HELP_CATEGORIES_V2.items():
+            if help_v2_category_visible(key, ctx_author):
                 options.append(discord.SelectOption(
                     label=cat["label"], emoji=cat["emoji"], value=key
                 ))
@@ -3073,24 +3754,19 @@ class HelpDropdown(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         key = self.values[0]
-        if key != "home" and not help_category_visible(key, self.user_rank):
-            return await interaction.response.send_message(
-                "Tu n'as pas accès à cette catégorie.", ephemeral=True
-            )
         await interaction.response.edit_message(
-            embed=build_help_embed_for(key, self.user_rank), view=self.view
+            embed=build_help_embed_for_v2(key, self.ctx_author), view=self.view
         )
 
 
-class HelpView(discord.ui.View):
-    def __init__(self, author_id, user_rank):
+class HelpViewV2(discord.ui.View):
+    def __init__(self, ctx_author):
         super().__init__(timeout=120)
-        self.author_id = author_id
-        self.user_rank = user_rank
-        self.add_item(HelpDropdown(user_rank))
+        self.ctx_author = ctx_author
+        self.add_item(HelpDropdownV2(ctx_author))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
+        if interaction.user.id != self.ctx_author.id:
             await interaction.response.send_message(
                 f"Ce menu n'est pas à toi. Fais `{get_prefix_cached()}help` pour voir le tien.",
                 ephemeral=True,
@@ -3105,11 +3781,146 @@ class HelpView(discord.ui.View):
 
 @bot.command(name="help")
 async def _help(ctx):
+    """Help dynamique — staff-only."""
     if await check_bot_ban(ctx):
         return
-    rank = get_rank_db(ctx.author.id)
-    view = HelpView(ctx.author.id, rank)
-    await ctx.send(embed=build_help_home_embed(rank), view=view)
+    # Refus silencieux pour membres sans accès
+    if not is_sys_or_buyer(ctx.author.id) and get_member_perm_level(ctx.author) == 0:
+        return  # SILENT
+    view = HelpViewV2(ctx.author)
+    await ctx.send(embed=build_help_home_embed_v2(ctx.author), view=view)
+
+
+# ========================= HELPALL PAGINÉ PAR NIVEAU =========================
+
+def build_helpall_page(level, ctx_author):
+    """
+    Page du helpall pour un niveau de perm donné.
+    Affiche toutes les commandes qui sont au niveau EXACT = level.
+    """
+    p = get_prefix_cached()
+    cmd_perms = get_cmd_perms()
+
+    # Liste les commandes au niveau exact
+    cmds_at_level = sorted([cmd for cmd, lvl in cmd_perms.items() if lvl == level])
+
+    # Construction embed
+    em = discord.Embed(
+        title=f"🎚️  Perm {level} / {MAX_PERM_LEVEL}",
+        color=embed_color(),
+    )
+
+    member_perm = get_member_perm_level(ctx_author)
+    if is_sys_or_buyer(ctx_author.id):
+        access_note = "✅ **Sys/Buyer** — tu as accès à tous les niveaux."
+    elif member_perm >= level:
+        access_note = f"✅ Tu as accès à ce niveau (ton niveau : **{member_perm}**)."
+    else:
+        access_note = f"🔒 Ton niveau ({member_perm}) est trop bas pour ces commandes."
+
+    if not cmds_at_level:
+        em.description = f"{access_note}\n\n*Aucune commande configurée au niveau {level}.*"
+    else:
+        # Descriptions courtes par commande
+        descriptions = {
+            "warn":        "Avertir un membre",
+            "mute":        "Mute textuel (timeout Discord)",
+            "vmute":       "Mute vocal",
+            "unmute":      "Retirer un mute",
+            "unvmute":     "Retirer un vmute",
+            "kick":        "Expulser du serveur",
+            "ban":         "Bannir (temporaire ou perm)",
+            "unban":       "Débannir",
+            "unwarn":      "Annuler un warn",
+            "unsanction":  "Annuler une sanction",
+            "clearwarns":  "Effacer tous les warns d'un membre",
+            "resetcasier": "Wipe complet du casier",
+            "casier":      "Voir le casier d'un membre",
+            "sanction":    "Détail d'une sanction par ID",
+            "note":        "Ajouter une note staff privée",
+            "notes":       "Lire les notes d'un membre",
+            "delnote":     "Supprimer une note",
+            "clear":       "Supprimer n messages",
+            "lock":        "Verrouiller un salon",
+            "unlock":      "Déverrouiller un salon",
+            "slowmode":    "Configurer le slowmode",
+            "modstats":    "Stats de modération",
+            "mylimits":    "Tes quotas restants avant limite",
+        }
+        lines = []
+        for cmd in cmds_at_level:
+            desc = descriptions.get(cmd, "(pas de description)")
+            # Limite actuelle pour ce niveau
+            limit = get_limit_for(cmd, level)
+            limit_str = ""
+            if limit:
+                max_a, window = limit
+                limit_str = f" ・ *max {max_a}/{window}min*"
+            lines.append(f"• `{p}{cmd}` — {desc}{limit_str}")
+        em.description = f"{access_note}\n\n" + "\n".join(lines)
+
+    em.set_footer(text=f"Sanction ・ Page {level}/{MAX_PERM_LEVEL} ・ ← → pour naviguer")
+    return em
+
+
+class HelpAllView(discord.ui.View):
+    def __init__(self, ctx_author, start_level=1):
+        super().__init__(timeout=120)
+        self.ctx_author = ctx_author
+        self.current_level = start_level
+        self.max_accessible = MAX_PERM_LEVEL if is_sys_or_buyer(ctx_author.id) else get_member_perm_level(ctx_author)
+        self._update_buttons()
+
+    def _update_buttons(self):
+        # Bouton gauche : désactivé si on est au niveau 1
+        self.prev_btn.disabled = (self.current_level <= 1)
+        # Bouton droit : désactivé si on est au max accessible
+        self.next_btn.disabled = (self.current_level >= self.max_accessible)
+
+    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_level > 1:
+            self.current_level -= 1
+            self._update_buttons()
+            await interaction.response.edit_message(
+                embed=build_helpall_page(self.current_level, self.ctx_author),
+                view=self,
+            )
+
+    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_level < self.max_accessible:
+            self.current_level += 1
+            self._update_buttons()
+            await interaction.response.edit_message(
+                embed=build_helpall_page(self.current_level, self.ctx_author),
+                view=self,
+            )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx_author.id:
+            await interaction.response.send_message(
+                "Ce menu n'est pas à toi.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+@bot.command(name="helpall")
+async def _helpall(ctx):
+    """Help paginé par niveau de perm. ← → pour naviguer jusqu'à ton niveau max."""
+    if await check_bot_ban(ctx):
+        return
+    # Bot staff-only
+    if not is_sys_or_buyer(ctx.author.id) and get_member_perm_level(ctx.author) == 0:
+        return  # SILENT
+
+    view = HelpAllView(ctx.author, start_level=1)
+    await ctx.send(embed=build_helpall_page(1, ctx.author), view=view)
 
 
 # ========================= RUN =========================
