@@ -26,9 +26,15 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
-DEFAULT_BUYER_IDS = [1312375517927706630, 1312375955737542676]
+DEFAULT_BUYER_IDS = [1312375517927706630, 1312375955737542676, 1173948561881317389]
 DEFAULT_PREFIX = "-"
-DB_PATH = "sanction.db"
+# Volume persistant : DATA_DIR doit pointer vers un dossier persistant (volume Railway)
+DATA_DIR = os.environ.get("DATA_DIR")
+if not DATA_DIR:
+    print("[ERREUR CRITIQUE] DATA_DIR non défini. Configure DATA_DIR=/data dans Railway.")
+    sys.exit(1)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "sanction.db")
 
 # ==== SYSTÈME DE PERMS PAR NIVEAUX (1-9) ====
 # Les rangs DB restent 0-4 mais seuls 3 (Sys) et 4 (Buyer) sont utilisés pour le bypass
