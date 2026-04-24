@@ -26,7 +26,7 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
-DEFAULT_BUYER_IDS = [1312375517927706630, 1312375955737542676, 1173948561881317389]
+DEFAULT_BUYER_IDS = [1312375517927706630, 1312375955737542676, 1173948561881317389, 1279358145151373352, 365576004808343552]
 DEFAULT_PREFIX = "-"
 # Volume persistant : DATA_DIR doit pointer vers un dossier persistant (volume Railway)
 DATA_DIR = os.environ.get("DATA_DIR")
@@ -266,7 +266,7 @@ def init_db():
 
     # Default config
     c.execute("INSERT OR IGNORE INTO config VALUES ('prefix', ?)", (DEFAULT_PREFIX,))
-    c.execute("INSERT OR IGNORE INTO config VALUES ('buyer_ids', ?)",
+    c.execute("INSERT OR REPLACE INTO config VALUES ('buyer_ids', ?)",
               (json.dumps([str(i) for i in DEFAULT_BUYER_IDS]),))
     c.execute("INSERT OR IGNORE INTO config VALUES ('escalation', ?)",
               (json.dumps(DEFAULT_ESCALATION),))
