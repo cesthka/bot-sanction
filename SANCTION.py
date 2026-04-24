@@ -3628,6 +3628,28 @@ def help_v2_category_visible(category_key, ctx_author):
     return len(help_v2_accessible_items(category_key, ctx_author)) > 0
 
 
+def _sanction_apply_thumbnail(em, ctx_author):
+    """Ajoute l'icône du serveur en thumbnail si dispo."""
+    guild = getattr(ctx_author, "guild", None)
+    if guild and getattr(guild, "icon", None):
+        try:
+            em.set_thumbnail(url=guild.icon.url)
+        except (AttributeError, TypeError):
+            pass
+
+
+# Sous-titres par catégorie Sanction (nouveau)
+CATEGORY_SUBTITLES = {
+    "moderation":   "Avertir, mute, kick, ban et gestion des sanctions.",
+    "casier":       "Consulter les casiers et les notes staff.",
+    "utilitaires":  "Purge, slowmode, lock et autres outils rapides.",
+    "mes_limites":  "Suivi personnel de tes quotas de commandes.",
+    "perms_admin":  "Configuration fine des niveaux de permission.",
+    "config":       "Anti-raid, escalation, salons autorisés.",
+    "buyer":        "Config ultime — réservée au Buyer.",
+}
+
+
 def build_help_category_embed_v2(category_key, ctx_author):
     p = get_prefix_cached()
     cat = HELP_CATEGORIES_V2[category_key]
@@ -3635,67 +3657,132 @@ def build_help_category_embed_v2(category_key, ctx_author):
     if category_key == "hierarchy":
         return build_help_hierarchy_embed_v2(ctx_author)
 
-    em = discord.Embed(title=cat["title"], color=embed_color())
+    # Titre sans l'emoji devant (on le remet proprement)
+    title_clean = cat["title"]
+    # Enlever le double-espace et l'emoji au début si présent
+    for em_char in ["⚠️", "📋", "🛠️", "⏱️", "🎚️", "⚙️", "👑"]:
+        if title_clean.startswith(em_char):
+            title_clean = title_clean[len(em_char):].strip()
+            break
+
+    emoji = cat.get("emoji", "📋")
+    subtitle = CATEGORY_SUBTITLES.get(category_key, "")
+
+    em = discord.Embed(
+        title=f"{emoji}  {title_clean}",
+        description=subtitle if subtitle else None,
+        color=embed_color(),
+    )
+    _sanction_apply_thumbnail(em, ctx_author)
+
     items = help_v2_accessible_items(category_key, ctx_author)
     if not items:
-        em.description = "*Aucune commande accessible à ton niveau de perm.*"
+        em.add_field(
+            name="⛔ Aucune commande accessible",
+            value="Ton niveau de perm est trop bas pour cette catégorie.",
+            inline=False,
+        )
     else:
-        max_syntax = max(len(f"{p}{syntax}") for syntax, _ in items)
-        lines = [
-            f"{p}{syntax}".ljust(max_syntax + 2) + f"→ {desc}"
-            for syntax, desc in items
-        ]
-        em.description = "```\n" + "\n".join(lines) + "\n```"
+        # Une ligne par commande, format `{prefix}{syntax}` — description
+        lines = [f"`{p}{syntax}` — {desc}" for syntax, desc in items]
+        # Si beaucoup de commandes, on split en 2 fields pour éviter la limite 1024 chars
+        half = (len(lines) + 1) // 2
+        if len(lines) > 8:
+            em.add_field(name="Commandes", value="\n".join(lines[:half]), inline=False)
+            em.add_field(name="\u200b", value="\n".join(lines[half:]), inline=False)
+        else:
+            em.add_field(name="Commandes", value="\n".join(lines), inline=False)
+
+    # Astuce pour la catégorie modération
+    if category_key == "moderation":
+        em.add_field(
+            name="💡 Astuce",
+            value=(
+                f"Les warns déclenchent une **escalation automatique** "
+                f"(mute → kick → ban) selon la config `{p}escalation`."
+            ),
+            inline=False,
+        )
+
     em.set_footer(text="Sanction ・ Meira")
     return em
 
 
 def build_help_hierarchy_embed_v2(ctx_author):
-    em = discord.Embed(title="📋  Hiérarchie & fonctionnement", color=embed_color())
+    em = discord.Embed(
+        title="📋  Hiérarchie & fonctionnement",
+        description="Les rangs du bot et le système de permissions.",
+        color=embed_color(),
+    )
+    _sanction_apply_thumbnail(em, ctx_author)
+
     rank = get_rank_db(ctx_author.id)
     member_perm = get_member_perm_level(ctx_author)
 
-    lines = []
-    lines.append("**🏛️  Système de rangs DB**")
-    lines.append("```\nBuyer > Sys > (staff = rôles+perms)\n```")
-
+    # Rangs DB
+    rangs_desc = []
     if rank == 4:
-        lines.append("> 👑 **Buyer** ← toi — Config ultime, bypass total")
-    elif rank == 3:
-        lines.append("> 👑 Buyer — Config ultime, bypass total")
-        lines.append("> 🔧 **Sys** ← toi — Bypass tout (perms et limites), gère le système de perms")
+        rangs_desc.append("👑 **Buyer**  ← toi — Config ultime, bypass total")
     else:
-        lines.append("> 👑 Buyer — Config ultime, bypass total")
-        lines.append("> 🔧 Sys — Bypass tout, gère le système de perms")
-    lines.append("")
-    lines.append("**🎚️  Niveaux de perm (1-9)** — configurés par Sys+")
-    lines.append("Les rôles Discord sont assignés à un niveau de perm.")
-    lines.append("Chaque commande de modération a un niveau requis.")
-    lines.append("Avoir le rôle perm X → accès à toutes les cmds de perm ≤ X.")
-    lines.append("")
-    if rank < 3 and member_perm > 0:
-        lines.append(f"> **Ton niveau actuel : perm {member_perm}**")
-        lines.append(f"> Tu peux utiliser toutes les commandes de perm 1 à {member_perm}.")
-        lines.append(f"> Utilise `{get_prefix_cached()}helpall` pour voir ce que tu as accès.")
-    elif rank >= 3:
-        lines.append(f"> Tu es **{rank_name(rank)}** — bypass total")
-    lines.append("")
-    lines.append("**⏱️  Limites et derank auto**")
-    lines.append("Chaque commande a une limite **X actions par Y minutes** (configurable).")
-    lines.append("Dépasser la limite = **retrait automatique du rôle perm concerné** + DM.")
-    lines.append("Demande un rerank à un Sys+ en justifiant ton acte.")
-    lines.append("Sys/Buyer ne sont **jamais** limités.")
+        rangs_desc.append("👑 **Buyer** — Config ultime, bypass total")
+    if rank == 3:
+        rangs_desc.append("🔧 **Sys**  ← toi — Bypass tout, gère les perms")
+    else:
+        rangs_desc.append("🔧 **Sys** — Bypass tout, gère les perms")
+    rangs_desc.append("🛡️ **Staff** — Rôles + niveaux de perm configurés")
 
-    em.description = "\n".join(lines)
+    em.add_field(
+        name="🏛️ Rangs du bot",
+        value="\n".join(rangs_desc),
+        inline=False,
+    )
+
+    # Niveaux de perm
+    em.add_field(
+        name="🎚️ Niveaux de permission (1-9)",
+        value=(
+            "Les **rôles Discord** sont assignés à un niveau par les Sys+.\n"
+            "Chaque **commande** a un niveau requis.\n"
+            "Avoir un rôle perm X → accès à toutes les commandes de perm **≤ X**."
+        ),
+        inline=False,
+    )
+
+    # Ton niveau perso
+    if rank < 3 and member_perm > 0:
+        em.add_field(
+            name=f"🎯 Ton niveau actuel : perm {member_perm}",
+            value=(
+                f"Tu peux utiliser toutes les commandes de perm 1 à {member_perm}.\n"
+                f"Tape `{get_prefix_cached()}helpall` pour voir ce que tu peux faire."
+            ),
+            inline=False,
+        )
+    elif rank >= 3:
+        em.add_field(
+            name=f"🎯 Ton rang : {rank_name(rank)}",
+            value="Bypass total — pas de limite, pas de niveau requis.",
+            inline=False,
+        )
+
+    # Limites & derank auto
+    em.add_field(
+        name="⏱️ Limites & derank automatique",
+        value=(
+            "Chaque commande a une limite **X actions / Y minutes**.\n"
+            "Dépasser = **retrait automatique du rôle perm concerné** + DM.\n"
+            "Demande un `rerank` à un Sys+ en justifiant ton acte.\n"
+            "Sys/Buyer ne sont **jamais** limités."
+        ),
+        inline=False,
+    )
+
     em.set_footer(text="Sanction ・ Meira")
     return em
 
 
 def build_help_home_embed_v2(ctx_author):
     p = get_prefix_cached()
-    em = discord.Embed(color=embed_color())
-    em.set_author(name="Sanction ─ Panel d'aide staff")
-
     rank = get_rank_db(ctx_author.id)
     member_perm = get_member_perm_level(ctx_author)
 
@@ -3706,11 +3793,16 @@ def build_help_home_embed_v2(ctx_author):
     else:
         status_line = "**Aucun accès au bot.**"
 
-    intro = (
-        f"```\n🕐  {get_french_time()}\n```\n"
-        f"**Sanction** — bot de modération staff-only.\n\n"
-        f"**Prefix :** `{p}` ・ {status_line}\n\n"
+    em = discord.Embed(
+        title="🛡️  Panel d'aide — Sanction",
+        description=(
+            f"Bot de **modération staff-only** pour Meira.\n"
+            f"**Prefix :** `{p}` ・ {status_line}\n\n"
+            f"*Choisis une catégorie ci-dessous pour voir ses commandes.*"
+        ),
+        color=embed_color(),
     )
+    _sanction_apply_thumbnail(em, ctx_author)
 
     category_descs = {
         "moderation":  "Warn, mute, kick, ban, unsanction",
@@ -3720,21 +3812,35 @@ def build_help_home_embed_v2(ctx_author):
         "perms_admin": "Gérer le système de perms (Sys+)",
         "config":      "Anti-raid, escalation, salons (Sys+)",
         "buyer":       "Prefix, setlog, sys/unsys (Buyer)",
-        "hierarchy":   "Comment ça marche",
+        "hierarchy":   "Comment fonctionne le système",
     }
-    visible = []
-    for key, desc in category_descs.items():
+
+    # Séparer staff (modération) et admin (sys/buyer)
+    staff_keys = ["moderation", "casier", "utilitaires", "mes_limites"]
+    admin_keys = ["perms_admin", "config", "buyer", "hierarchy"]
+
+    staff_lines = []
+    for key in staff_keys:
         if help_v2_category_visible(key, ctx_author):
             cat = HELP_CATEGORIES_V2[key]
-            visible.append(f"> {cat['emoji']} **{cat['label']}** — {desc}")
+            staff_lines.append(f"{cat['emoji']} **{cat['label']}** — {category_descs[key]}")
+    if staff_lines:
+        em.add_field(name="🛡️ Modération", value="\n".join(staff_lines), inline=False)
 
-    em.description = intro + ("\n".join(visible) if visible else "*Aucune catégorie disponible.*")
+    admin_lines = []
+    for key in admin_keys:
+        if help_v2_category_visible(key, ctx_author):
+            cat = HELP_CATEGORIES_V2[key]
+            admin_lines.append(f"{cat['emoji']} **{cat['label']}** — {category_descs[key]}")
+    if admin_lines:
+        em.add_field(name="⚙️ Admin & Config", value="\n".join(admin_lines), inline=False)
+
     em.add_field(
         name="💡 Astuce",
         value=f"Utilise `{p}helpall` pour un affichage **paginé par niveau de perm**.",
         inline=False,
     )
-    em.set_footer(text="Sanction ・ Meira")
+    em.set_footer(text=f"Sanction ・ Meira ・ {get_french_time()}")
     return em
 
 
@@ -3815,6 +3921,7 @@ def build_helpall_page(level, ctx_author):
         title=f"🎚️  Perm {level} / {MAX_PERM_LEVEL}",
         color=embed_color(),
     )
+    _sanction_apply_thumbnail(em, ctx_author)
 
     member_perm = get_member_perm_level(ctx_author)
     if is_sys_or_buyer(ctx_author.id):
